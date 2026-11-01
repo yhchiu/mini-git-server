@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROGRAM=${0##*/}
-VERSION="0.2.5"
+VERSION="0.2.6"
 DEFAULT_GIT_USER="git"
 DEFAULT_SSH_PORT="22"
 DEFAULT_SSHD_DROPIN="/etc/ssh/sshd_config.d/90-gitolite.conf"
@@ -413,8 +413,12 @@ server_doctor() {
   check_warn() { printf '[WARN] %s\n' "$*"; warnings=$((warnings+1)); }
   check_bad()  { printf '[FAIL] %s\n' "$*"; errors=$((errors+1)); }
 
-  for cmd in git gitolite sshd; do
-    if command -v "$cmd" >/dev/null 2>&1; then check_ok "$cmd is installed"; else check_bad "$cmd is missing"; fi
+  for dependency in git gitolite sshd; do
+    if command -v "$dependency" >/dev/null 2>&1; then
+      check_ok "$dependency is installed"
+    else
+      check_bad "$dependency is missing"
+    fi
   done
 
   if sshd -t; then check_ok "sshd configuration is valid"; else check_bad "sshd configuration is invalid"; fi
@@ -1131,25 +1135,25 @@ repo_show() {
     done
   fi
 
-  local -a cmd=("$0" repo-set --repo "$repo" --owner "$owner")
-  [[ -n $writers ]] && cmd+=(--writers "$(spaces_to_csv "$writers")")
-  [[ -n $agents ]] && cmd+=(--agents "$(spaces_to_csv "$agents")")
-  [[ -n $readers ]] && cmd+=(--readers "$(spaces_to_csv "$readers")")
+  local -a reapply_cmd=("$0" repo-set --repo "$repo" --owner "$owner")
+  [[ -n $writers ]] && reapply_cmd+=(--writers "$(spaces_to_csv "$writers")")
+  [[ -n $agents ]] && reapply_cmd+=(--agents "$(spaces_to_csv "$agents")")
+  [[ -n $readers ]] && reapply_cmd+=(--readers "$(spaces_to_csv "$readers")")
   for branch in "${protected_branches[@]}"; do
-    cmd+=(--protected-branch "$branch")
+    reapply_cmd+=(--protected-branch "$branch")
   done
-  [[ -n $requested ]] && cmd+=(--admin-dir "$dir")
+  [[ -n $requested ]] && reapply_cmd+=(--admin-dir "$dir")
 
   printf '\nReapply command:\n'
-  shell_quote "${cmd[0]}"
+  shell_quote "${reapply_cmd[0]}"
   printf ' '
-  shell_quote "${cmd[1]}"
+  shell_quote "${reapply_cmd[1]}"
   local i
-  for ((i=2; i<${#cmd[@]}; i+=2)); do
+  for ((i=2; i<${#reapply_cmd[@]}; i+=2)); do
     printf ' \\\n  '
-    shell_quote "${cmd[i]}"
+    shell_quote "${reapply_cmd[i]}"
     printf ' '
-    shell_quote "${cmd[i+1]}"
+    shell_quote "${reapply_cmd[i+1]}"
   done
   printf '\n'
 }
@@ -1227,9 +1231,9 @@ admin_apply() {
 }
 
 main() {
-  local cmd=${1:-help}
+  local command_name=${1:-help}
   [[ $# -eq 0 ]] || shift
-  case "$cmd" in
+  case "$command_name" in
     install)      server_install "$@" ;;
     status)       server_status "$@" ;;
     doctor)       server_doctor "$@" ;;
@@ -1248,7 +1252,7 @@ main() {
     apply)        admin_apply "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|-h|--help) usage ;;
-    *) usage >&2; die "Unknown command: $cmd" ;;
+    *) usage >&2; die "Unknown command: $command_name" ;;
   esac
 }
 
