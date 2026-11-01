@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck openssh-client git
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -n1
+          git --version
+          shellcheck --version
+
+      - name: Run checks
+        run: make check

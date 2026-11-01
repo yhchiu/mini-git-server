@@ -1,0 +1,1257 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PROGRAM=${0##*/}
+VERSION="0.2.5"
+DEFAULT_GIT_USER="git"
+DEFAULT_SSH_PORT="22"
+DEFAULT_SSHD_DROPIN="/etc/ssh/sshd_config.d/90-gitolite.conf"
+DEFAULT_SSHD_PORT_DROPIN="/etc/ssh/sshd_config.d/00-gitolite-port.conf"
+
+log()  { printf '[INFO] %s\n' "$*" >&2; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+mini-git-server - minimal Git/Gitolite installation and administration helper
+
+Usage:
+  mini-git-server.sh <command> [options]
+
+Server commands (run on the Git server):
+  install         Install OpenSSH, Git and Gitolite, then initialize Gitolite
+  status          Show Git/Gitolite/SSH status
+  doctor          Run configuration and permission checks
+  backup          Create a Git-aware mirror backup of all repositories
+  fsck            Run git fsck on hosted repositories
+  repo-set-default Set a repository HEAD/default branch
+
+Admin-workstation commands (run inside or against a gitolite-admin clone):
+  admin-clone     Clone gitolite-admin from the server
+  admin-init      Enable script-managed per-repository config fragments
+  user-add        Add an SSH public key to gitolite-admin/keydir
+  user-remove     Remove an SSH public key from gitolite-admin/keydir
+  user-list       List Gitolite key identities
+  repo-set        Create/replace a script-managed repository ACL
+  repo-add        Alias for repo-set (backward compatibility)
+  repo-show       Show repository ACL state and a reusable repo-set command
+  repo-list       List configured repositories
+  apply           Review, commit and push gitolite-admin changes
+
+Other:
+  version         Show script version
+  help            Show this help
+
+Run '<command> --help' for command-specific usage.
+USAGE
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "This command must be run as root."
+}
+
+validate_simple_name() {
+  local value=$1 label=$2
+  [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || \
+    die "$label contains unsupported characters: $value"
+}
+
+validate_unix_user() {
+  local value=$1
+  [[ $value =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid Unix user name: $value"
+}
+
+validate_repo_name() {
+  local repo=$1
+  [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9_./-]*$ ]] || \
+    die "Invalid repository name: $repo"
+  [[ $repo != */ ]] || die "Repository name must not end with '/': $repo"
+  [[ $repo != *".."* ]] || die "Repository name must not contain '..': $repo"
+}
+
+validate_port() {
+  local port=$1
+  if [[ ! $port =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    die "Invalid SSH port: $port"
+  fi
+}
+
+validate_branch_name() {
+  local branch=$1
+  need_cmd git
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "Invalid branch name: $branch"
+}
+
+regex_escape() {
+  local value=$1 out="" ch i
+  for ((i=0; i<${#value}; i++)); do
+    ch=${value:i:1}
+    case "$ch" in
+      '.'|$'\\'|'+'|'*'|'?'|'['|']'|'('|')'|'{'|'}'|'^'|'$'|'|') out+="\\$ch" ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+branch_refex_exact() {
+  local branch=$1
+  printf 'refs/heads/%s$' "$(regex_escape "$branch")"
+}
+
+csv_to_spaces() {
+  local value=${1:-}
+  printf '%s\n' "$value" \
+    | tr ',' ' ' \
+    | awk '{ for (i=1; i<=NF; i++) if (!seen[$i]++) out = out (out ? " " : "") $i } END { print out }'
+}
+
+validate_user_list() {
+  local value=${1:-} item
+  [[ -z $value ]] && return 0
+  while IFS= read -r item; do
+    [[ -z $item ]] && continue
+    validate_simple_name "$item" "ACL user"
+  done < <(printf '%s\n' "$value" | tr ' ' '\n')
+}
+
+repo_fragment_name() {
+  local repo=$1
+  printf '%s' "$repo" | sed 's/%/%25/g; s#/#%2F#g'
+}
+
+find_admin_dir() {
+  local requested=${1:-}
+  local dir
+  if [[ -n $requested ]]; then
+    dir=$(cd "$requested" 2>/dev/null && pwd) || die "Admin directory not found: $requested"
+  else
+    dir=$(pwd)
+  fi
+
+  [[ -d "$dir/.git" ]] || die "Not a gitolite-admin working tree: $dir"
+  [[ -d "$dir/keydir" && -f "$dir/conf/gitolite.conf" ]] || \
+    die "Missing keydir/ or conf/gitolite.conf in: $dir"
+  printf '%s\n' "$dir"
+}
+
+ensure_clean_or_staged_admin_repo() {
+  local dir=$1
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not a Git working tree: $dir"
+}
+
+validate_pubkey() {
+  local key=$1
+  [[ -f $key ]] || die "Public key file not found: $key"
+  need_cmd ssh-keygen
+  ssh-keygen -l -f "$key" >/dev/null 2>&1 || die "Invalid OpenSSH public key: $key"
+  local key_type
+  key_type=$(awk 'NF && $1 !~ /^#/ {print $1; exit}' "$key")
+  case "$key_type" in
+    ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa)
+      ;;
+    *) warn "Uncommon SSH public key type: ${key_type:-unknown}" ;;
+  esac
+}
+
+server_install_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh install --admin-key FILE [options]
+
+Required:
+  --admin-key FILE       Admin OpenSSH public key
+
+Options:
+  --admin-name NAME      Gitolite admin identity (default: admin)
+  --git-user USER        Hosting Unix account (default: git)
+  --ssh-port PORT        Configure sshd listening port (default: 22)
+  --default-branch NAME  Set Git init.defaultBranch for newly created repositories
+  --no-ssh-hardening     Do not install the Match User SSH hardening drop-in
+  -h, --help
+
+Notes:
+  - Intended for a fresh Debian server.
+  - The hosting account password is locked.
+  - Gitolite controls ~/.ssh/authorized_keys; do not edit it manually later.
+USAGE
+}
+
+server_install() {
+  require_root
+  local admin_key="" admin_name="admin" git_user=$DEFAULT_GIT_USER ssh_port=$DEFAULT_SSH_PORT
+  local default_branch="" harden=1
+
+  while (($#)); do
+    case "$1" in
+      --admin-key) [[ $# -ge 2 ]] || die "--admin-key requires a value"; admin_key=$2; shift 2 ;;
+      --admin-name) [[ $# -ge 2 ]] || die "--admin-name requires a value"; admin_name=$2; shift 2 ;;
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || die "--ssh-port requires a value"; ssh_port=$2; shift 2 ;;
+      --default-branch) [[ $# -ge 2 ]] || die "--default-branch requires a value"; default_branch=$2; shift 2 ;;
+      --no-ssh-hardening) harden=0; shift ;;
+      -h|--help) server_install_usage; return 0 ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+  done
+
+  [[ -n $admin_key ]] || die "--admin-key is required"
+  validate_pubkey "$admin_key"
+  validate_simple_name "$admin_name" "Admin name"
+  validate_unix_user "$git_user"
+  validate_port "$ssh_port"
+
+  [[ -r /etc/os-release ]] || die "Cannot identify operating system"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  [[ ${ID:-} == "debian" ]] || die "This installer currently supports Debian only (detected: ${ID:-unknown})"
+  if [[ ${VERSION_ID:-} != "13" ]]; then
+    warn "Designed for Debian 13; detected Debian ${VERSION_ID:-unknown}. Continuing with distro packages."
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  log "Installing Debian packages: openssh-server git gitolite3 ca-certificates"
+  apt-get update
+  apt-get install -y openssh-server git gitolite3 ca-certificates
+
+  need_cmd git
+  need_cmd sshd
+  need_cmd runuser
+  need_cmd gitolite
+  [[ -z $default_branch ]] || validate_branch_name "$default_branch"
+
+  install -d -m 0755 /etc/ssh/sshd_config.d
+  local previous_port_dropin=""
+  if [[ -f $DEFAULT_SSHD_PORT_DROPIN ]]; then
+    previous_port_dropin=$(mktemp)
+    cp -a "$DEFAULT_SSHD_PORT_DROPIN" "$previous_port_dropin"
+  fi
+  cat >"$DEFAULT_SSHD_PORT_DROPIN" <<EOF_PORT
+# Managed by mini-git-server.sh
+Port $ssh_port
+EOF_PORT
+  chmod 0644 "$DEFAULT_SSHD_PORT_DROPIN"
+
+  if ! sshd -t; then
+    if [[ -n $previous_port_dropin ]]; then
+      cp -a "$previous_port_dropin" "$DEFAULT_SSHD_PORT_DROPIN"
+      rm -f "$previous_port_dropin"
+    else
+      rm -f "$DEFAULT_SSHD_PORT_DROPIN"
+    fi
+    die "sshd validation failed after configuring SSH port $ssh_port; previous SSH port configuration was restored."
+  fi
+
+  local effective_ports
+  effective_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, -)
+  if [[ -n $effective_ports && ",$effective_ports," != *",$ssh_port,"* ]]; then
+    if [[ -n $previous_port_dropin ]]; then
+      cp -a "$previous_port_dropin" "$DEFAULT_SSHD_PORT_DROPIN"
+      rm -f "$previous_port_dropin"
+    else
+      rm -f "$DEFAULT_SSHD_PORT_DROPIN"
+    fi
+    die "sshd does not report requested port $ssh_port as active configuration (effective ports: $effective_ports). Previous SSH port configuration was restored; check Include ordering in /etc/ssh/sshd_config."
+  fi
+  if [[ $effective_ports == *,* ]]; then
+    warn "sshd has multiple configured ports ($effective_ports). Another active Port directive exists outside $DEFAULT_SSHD_PORT_DROPIN."
+  fi
+  [[ -z $previous_port_dropin ]] || rm -f "$previous_port_dropin"
+
+  local git_home
+  if id "$git_user" >/dev/null 2>&1; then
+    git_home=$(getent passwd "$git_user" | cut -d: -f6)
+    [[ -n $git_home ]] || die "Cannot determine home directory for user: $git_user"
+  else
+    git_home="/home/$git_user"
+    log "Creating dedicated hosting account: $git_user"
+    useradd --create-home --home-dir "$git_home" --shell /bin/bash "$git_user"
+  fi
+
+  passwd -l "$git_user" >/dev/null 2>&1 || true
+  install -d -m 0700 -o "$git_user" -g "$git_user" "$git_home/.ssh"
+
+  if [[ -n $default_branch ]]; then
+    log "Setting Git default branch for new repositories to '$default_branch'"
+    runuser -u "$git_user" -- env HOME="$git_home" git config --global init.defaultBranch "$default_branch"
+  fi
+
+  if [[ -e "$git_home/.gitolite" || -e "$git_home/repositories/gitolite-admin.git" ]]; then
+    die "Gitolite already appears initialized for $git_user at $git_home; refusing to overwrite it."
+  fi
+
+  if [[ -s "$git_home/.ssh/authorized_keys" ]]; then
+    die "$git_home/.ssh/authorized_keys is not empty. Use a fresh hosting account or migrate carefully."
+  fi
+
+  local temp_key="$git_home/${admin_name}.pub"
+  install -m 0600 -o "$git_user" -g "$git_user" "$admin_key" "$temp_key"
+
+  log "Initializing Gitolite as '$git_user' with admin identity '$admin_name'"
+  runuser -u "$git_user" -- env HOME="$git_home" gitolite setup -pk "$temp_key"
+  rm -f "$temp_key"
+
+  if (( harden )); then
+    install -d -m 0755 /etc/ssh/sshd_config.d
+    local tmp_dropin
+    tmp_dropin=$(mktemp)
+    cat >"$tmp_dropin" <<EOF_HARDEN
+# Managed by mini-git-server.sh
+# Gitolite itself installs per-key forced commands in authorized_keys.
+# Do not add ForceCommand here.
+Match User $git_user
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+    PermitTTY no
+
+Match all
+EOF_HARDEN
+    install -m 0644 "$tmp_dropin" "$DEFAULT_SSHD_DROPIN"
+    rm -f "$tmp_dropin"
+
+    if ! sshd -t; then
+      rm -f "$DEFAULT_SSHD_DROPIN"
+      die "sshd validation failed; hardening drop-in was removed. Gitolite itself is installed."
+    fi
+  fi
+
+  systemctl reload ssh || systemctl restart ssh
+  log "Installation complete."
+  cat <<EOF_RESULT
+
+Server summary
+  Hosting user : $git_user
+  Home         : $git_home
+  SSH port     : $ssh_port
+  Default branch: ${default_branch:-Git default}
+  Admin user   : $admin_name
+  Repositories : $git_home/repositories
+
+From the admin workstation (using the private key matching $admin_key):
+  ssh -p $ssh_port $git_user@<server> info
+  GIT_SSH_COMMAND="ssh -p $ssh_port" git clone $git_user@<server>:gitolite-admin
+
+Recommended next step:
+  mini-git-server.sh admin-init --admin-dir ./gitolite-admin
+EOF_RESULT
+}
+
+server_status_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh status [--git-user USER]
+USAGE
+}
+
+server_status() {
+  local git_user=$DEFAULT_GIT_USER
+  while (($#)); do
+    case "$1" in
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      -h|--help) server_status_usage; return 0 ;;
+      *) die "Unknown status option: $1" ;;
+    esac
+  done
+  validate_unix_user "$git_user"
+  id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
+
+  local git_home
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  printf 'mini-git-server %s\n\n' "$VERSION"
+  printf '%-20s %s\n' "Hosting user:" "$git_user"
+  printf '%-20s %s\n' "Home:" "$git_home"
+  printf '%-20s %s\n' "Git:" "$(git --version 2>/dev/null || echo missing)"
+  printf '%-20s %s\n' "Gitolite:" "$(gitolite --version 2>/dev/null | head -n1 || echo missing)"
+  printf '%-20s %s\n' "SSH service:" "$(systemctl is-active ssh 2>/dev/null || echo unknown)"
+  printf '%-20s %s\n' "SSH ports:" "$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, - || echo unknown)"
+  printf '%-20s %s\n' "Default branch:" "$(runuser -u "$git_user" -- env HOME="$git_home" git config --global --get init.defaultBranch 2>/dev/null || echo Git-default)"
+  printf '%-20s %s\n' "Password status:" "$(passwd -S "$git_user" 2>/dev/null | awk '{print $2}' || echo unknown)"
+
+  local repo_count=0
+  if [[ -d "$git_home/repositories" ]]; then
+    repo_count=$(find "$git_home/repositories" -type d -name '*.git' -prune | wc -l)
+  fi
+  printf '%-20s %s\n' "Repository count:" "$repo_count"
+  printf '%-20s %s\n' "Repository storage:" "$(du -sh "$git_home/repositories" 2>/dev/null | awk '{print $1}' || echo n/a)"
+  local ssh_port_config="unmanaged" ssh_hardening="not-installed"
+  [[ -f $DEFAULT_SSHD_PORT_DROPIN ]] && ssh_port_config="managed"
+  [[ -f $DEFAULT_SSHD_DROPIN ]] && ssh_hardening="installed"
+  printf '%-20s %s\n' "SSH port config:" "$ssh_port_config"
+  printf '%-20s %s\n' "SSH hardening:" "$ssh_hardening"
+}
+
+server_doctor_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh doctor [--git-user USER]
+USAGE
+}
+
+server_doctor() {
+  require_root
+  local git_user=$DEFAULT_GIT_USER errors=0 warnings=0
+  while (($#)); do
+    case "$1" in
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      -h|--help) server_doctor_usage; return 0 ;;
+      *) die "Unknown doctor option: $1" ;;
+    esac
+  done
+
+  check_ok()   { printf '[ OK ] %s\n' "$*"; }
+  check_warn() { printf '[WARN] %s\n' "$*"; warnings=$((warnings+1)); }
+  check_bad()  { printf '[FAIL] %s\n' "$*"; errors=$((errors+1)); }
+
+  for cmd in git gitolite sshd; do
+    if command -v "$cmd" >/dev/null 2>&1; then check_ok "$cmd is installed"; else check_bad "$cmd is missing"; fi
+  done
+
+  if sshd -t; then check_ok "sshd configuration is valid"; else check_bad "sshd configuration is invalid"; fi
+  if systemctl is-active --quiet ssh; then check_ok "ssh service is active"; else check_bad "ssh service is not active"; fi
+
+  if ! id "$git_user" >/dev/null 2>&1; then
+    check_bad "hosting user '$git_user' does not exist"
+    printf '\nDoctor summary: %d failure(s), %d warning(s)\n' "$errors" "$warnings"
+    return 1
+  fi
+
+  local git_home
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  if [[ -d "$git_home/.gitolite" ]]; then
+    check_ok ".gitolite exists"
+  else
+    check_bad ".gitolite is missing"
+  fi
+  if [[ -d "$git_home/repositories/gitolite-admin.git" ]]; then
+    check_ok "gitolite-admin repository exists"
+  else
+    check_bad "gitolite-admin repository is missing"
+  fi
+  if [[ -f "$git_home/.ssh/authorized_keys" ]]; then
+    check_ok "authorized_keys exists"
+  else
+    check_bad "authorized_keys is missing"
+  fi
+
+  if [[ -f "$git_home/.ssh/authorized_keys" ]]; then
+    local unforced
+    unforced=$(awk 'NF && $1 !~ /^#/ && $0 !~ /command=/ {n++} END {print n+0}' "$git_home/.ssh/authorized_keys")
+    if (( unforced == 0 )); then
+      check_ok "all non-comment authorized_keys entries have forced commands"
+    else
+      local entry_word="entries"
+      (( unforced == 1 )) && entry_word="entry"
+      check_warn "$unforced authorized_keys $entry_word lack command= restrictions"
+    fi
+  fi
+
+  local home_owner
+  home_owner=$(stat -c '%U:%G' "$git_home")
+  if [[ $home_owner == "$git_user:$git_user" ]]; then
+    check_ok "home directory owner is $git_user:$git_user"
+  else
+    check_warn "home owner is $home_owner"
+  fi
+
+  if [[ -d "$git_home/repositories" ]]; then
+    local foreign_owned
+    foreign_owned=$(find "$git_home/repositories" \! -user "$git_user" -print -quit 2>/dev/null || true)
+    if [[ -z $foreign_owned ]]; then
+      check_ok "repository tree is owned by $git_user"
+    else
+      check_warn "repository tree contains files not owned by $git_user (example: $foreign_owned)"
+    fi
+  fi
+
+  local pass_state
+  pass_state=$(passwd -S "$git_user" 2>/dev/null | awk '{print $2}')
+  case "$pass_state" in
+    L|LK) check_ok "hosting account password is locked" ;;
+    *) check_warn "hosting account password state is '$pass_state' (expected locked)" ;;
+  esac
+
+  if [[ -f $DEFAULT_SSHD_PORT_DROPIN ]]; then
+    check_ok "managed SSH port drop-in is installed"
+  else
+    check_warn "managed SSH port drop-in is not installed"
+  fi
+
+  if [[ -f $DEFAULT_SSHD_DROPIN ]]; then
+    check_ok "SSH hardening drop-in is installed"
+  else
+    check_warn "SSH hardening drop-in is not installed"
+  fi
+
+  if runuser -u "$git_user" -- env HOME="$git_home" gitolite sshkeys-lint >/dev/null 2>&1; then
+    check_ok "gitolite sshkeys-lint passed"
+  else
+    check_warn "gitolite sshkeys-lint returned a non-zero status; run it manually for details"
+  fi
+
+  printf '\nDoctor summary: %d failure(s), %d warning(s)\n' "$errors" "$warnings"
+  (( errors == 0 ))
+}
+
+server_backup_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh backup [options]
+
+Options:
+  --git-user USER      Hosting Unix account (default: git)
+  --output DIR         Backup parent directory (default: /var/backups/gitolite)
+  -h, --help
+
+The backup uses 'git clone --mirror' via file:// for each repository, avoiding
+filesystem-level copies of repositories while pushes may be occurring.
+USAGE
+}
+
+server_backup() {
+  require_root
+  local git_user=$DEFAULT_GIT_USER output="/var/backups/gitolite"
+  while (($#)); do
+    case "$1" in
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output=$2; shift 2 ;;
+      -h|--help) server_backup_usage; return 0 ;;
+      *) die "Unknown backup option: $1" ;;
+    esac
+  done
+
+  id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
+  local git_home repos_root stamp backup_dir
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  repos_root="$git_home/repositories"
+  [[ -d $repos_root ]] || die "Repository directory not found: $repos_root"
+
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  backup_dir="$output/$stamp"
+  install -d -m 0700 "$backup_dir/repos" "$backup_dir/meta"
+
+  log "Creating mirror backup in $backup_dir"
+  local repo rel dest count=0 failed=0
+  while IFS= read -r -d '' repo; do
+    rel=${repo#"$repos_root/"}
+    dest="$backup_dir/repos/$rel"
+    mkdir -p "$(dirname "$dest")"
+    log "Backing up $rel"
+    if git clone --quiet --mirror "file://$repo" "$dest" && git -C "$dest" fsck --full --no-dangling >/dev/null; then
+      count=$((count+1))
+    else
+      warn "Backup failed for $rel"
+      failed=$((failed+1))
+    fi
+  done < <(find "$repos_root" -type d -name '*.git' -prune -print0)
+
+  if [[ -f "$git_home/.gitolite.rc" ]]; then
+    cp -a "$git_home/.gitolite.rc" "$backup_dir/meta/"
+  fi
+  if [[ -f $DEFAULT_SSHD_PORT_DROPIN ]]; then
+    cp -a "$DEFAULT_SSHD_PORT_DROPIN" "$backup_dir/meta/"
+  fi
+  if [[ -f $DEFAULT_SSHD_DROPIN ]]; then
+    cp -a "$DEFAULT_SSHD_DROPIN" "$backup_dir/meta/"
+  fi
+  {
+    printf 'created=%s\n' "$(date --iso-8601=seconds)"
+    printf 'host=%s\n' "$(hostname -f 2>/dev/null || hostname)"
+    printf 'git_user=%s\n' "$git_user"
+    printf 'git_version=%s\n' "$(git --version)"
+    printf 'gitolite_version=%s\n' "$(gitolite --version 2>/dev/null | head -n1 || true)"
+    printf 'repositories=%d\n' "$count"
+    printf 'failed=%d\n' "$failed"
+    dpkg-query -W -f='package=${binary:Package} version=${Version}\n' git openssh-server gitolite3 2>/dev/null || true
+  } >"$backup_dir/meta/manifest.txt"
+
+  if (( failed > 0 )); then
+    die "Backup completed with $failed failed repository/repositories. Partial backup: $backup_dir"
+  fi
+  printf '%s\n' "$backup_dir"
+}
+
+server_fsck_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh fsck [--git-user USER] [--repo REPO]
+
+Without --repo, checks every hosted repository.
+USAGE
+}
+
+server_fsck() {
+  require_root
+  local git_user=$DEFAULT_GIT_USER only_repo=""
+  while (($#)); do
+    case "$1" in
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      --repo) [[ $# -ge 2 ]] || die "--repo requires a value"; only_repo=$2; shift 2 ;;
+      -h|--help) server_fsck_usage; return 0 ;;
+      *) die "Unknown fsck option: $1" ;;
+    esac
+  done
+  id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
+  local git_home repos_root failures=0
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  repos_root="$git_home/repositories"
+
+  if [[ -n $only_repo ]]; then
+    validate_repo_name "$only_repo"
+    local path="$repos_root/$only_repo.git"
+    [[ -d $path ]] || die "Repository not found: $only_repo"
+    runuser -u "$git_user" -- git -C "$path" fsck --full
+    return
+  fi
+
+  local repo rel
+  while IFS= read -r -d '' repo; do
+    rel=${repo#"$repos_root/"}
+    printf '== %s ==\n' "$rel"
+    if ! runuser -u "$git_user" -- git -C "$repo" fsck --full; then
+      failures=$((failures+1))
+    fi
+  done < <(find "$repos_root" -type d -name '*.git' -prune -print0)
+
+  (( failures == 0 )) || die "$failures repository/repositories failed fsck"
+}
+
+server_repo_set_default_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh repo-set-default --repo NAME --branch BRANCH [options]
+
+Options:
+  --repo NAME          Repository name (required)
+  --branch BRANCH      Branch to point repository HEAD at (required)
+  --git-user USER      Hosting Unix account (default: git)
+  --require-existing   Fail unless refs/heads/BRANCH already exists
+  -h, --help
+
+By default, HEAD may point to an unborn branch. This is useful for an empty
+repository before its first push.
+USAGE
+}
+
+server_repo_set_default() {
+  require_root
+  local repo="" branch="" git_user=$DEFAULT_GIT_USER require_existing=0
+  while (($#)); do
+    case "$1" in
+      --repo) [[ $# -ge 2 ]] || die "--repo requires a value"; repo=$2; shift 2 ;;
+      --branch) [[ $# -ge 2 ]] || die "--branch requires a value"; branch=$2; shift 2 ;;
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      --require-existing) require_existing=1; shift ;;
+      -h|--help) server_repo_set_default_usage; return 0 ;;
+      *) die "Unknown repo-set-default option: $1" ;;
+    esac
+  done
+
+  [[ -n $repo && -n $branch ]] || die "--repo and --branch are required"
+  validate_repo_name "$repo"
+  validate_branch_name "$branch"
+  validate_unix_user "$git_user"
+  id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
+
+  local git_home path
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  path="$git_home/repositories/$repo.git"
+  [[ -d $path ]] || die "Repository not found: $repo"
+
+  if (( require_existing )) && ! runuser -u "$git_user" -- git -C "$path" show-ref --verify --quiet "refs/heads/$branch"; then
+    die "Branch does not exist in repository: $branch"
+  fi
+
+  runuser -u "$git_user" -- git -C "$path" symbolic-ref HEAD "refs/heads/$branch"
+  log "Default branch for '$repo' is now '$branch'."
+}
+
+admin_clone_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh admin-clone --host HOST [options]
+
+Options:
+  --host HOST           Git server hostname/IP (required)
+  --ssh-user USER       SSH hosting user (default: git)
+  --port PORT           SSH port (default: 22)
+  --dir DIR             Destination (default: ./gitolite-admin)
+  --identity FILE       SSH private key to use
+  -h, --help
+USAGE
+}
+
+admin_clone() {
+  local host="" ssh_user=$DEFAULT_GIT_USER port=$DEFAULT_SSH_PORT dir="gitolite-admin" identity=""
+  while (($#)); do
+    case "$1" in
+      --host) [[ $# -ge 2 ]] || die "--host requires a value"; host=$2; shift 2 ;;
+      --ssh-user) [[ $# -ge 2 ]] || die "--ssh-user requires a value"; ssh_user=$2; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || die "--port requires a value"; port=$2; shift 2 ;;
+      --dir) [[ $# -ge 2 ]] || die "--dir requires a value"; dir=$2; shift 2 ;;
+      --identity) [[ $# -ge 2 ]] || die "--identity requires a value"; identity=$2; shift 2 ;;
+      -h|--help) admin_clone_usage; return 0 ;;
+      *) die "Unknown admin-clone option: $1" ;;
+    esac
+  done
+  [[ -n $host ]] || die "--host is required"
+  [[ $host != *[[:space:]]* ]] || die "Host must not contain whitespace"
+  validate_unix_user "$ssh_user"
+  validate_port "$port"
+  need_cmd git
+  need_cmd ssh
+  [[ ! -e $dir ]] || die "Destination already exists: $dir"
+
+  local ssh_cmd="ssh -p $port" quoted_identity
+  if [[ -n $identity ]]; then
+    [[ -f $identity ]] || die "Identity file not found: $identity"
+    printf -v quoted_identity '%q' "$identity"
+    ssh_cmd+=" -o IdentitiesOnly=yes -i $quoted_identity"
+  fi
+
+  GIT_SSH_COMMAND="$ssh_cmd" git clone "$ssh_user@$host:gitolite-admin" "$dir"
+  log "Cloned gitolite-admin to $dir"
+}
+
+admin_init_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh admin-init [--admin-dir DIR]
+
+Adds this line to conf/gitolite.conf if missing:
+  include "repos/*.conf"
+
+and creates conf/repos/. Script-managed repo ACLs are stored there.
+USAGE
+}
+
+admin_init() {
+  local requested=""
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) admin_init_usage; return 0 ;;
+      *) die "Unknown admin-init option: $1" ;;
+    esac
+  done
+  local dir
+  dir=$(find_admin_dir "$requested")
+  ensure_clean_or_staged_admin_repo "$dir"
+  mkdir -p "$dir/conf/repos"
+  if ! grep -Fqx 'include "repos/*.conf"' "$dir/conf/gitolite.conf"; then
+    printf '\n# Script-managed repository ACLs\ninclude "repos/*.conf"\n' >>"$dir/conf/gitolite.conf"
+    log "Added include \"repos/*.conf\" to conf/gitolite.conf"
+  else
+    log "Repository fragment include already present"
+  fi
+  touch "$dir/conf/repos/.gitkeep"
+  git -C "$dir" add conf/gitolite.conf conf/repos/.gitkeep
+  git -C "$dir" status --short
+}
+
+user_add_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh user-add --name USER --key FILE [options]
+
+Options:
+  --name USER           Logical Gitolite identity (required)
+  --key FILE            OpenSSH public key (required)
+  --key-id ID           Device/key label. Stores keydir/ID/USER.pub
+                        so several keys can map to the same USER.
+  --admin-dir DIR       gitolite-admin working tree (default: current dir)
+  --replace             Replace an existing key at the same key path
+  -h, --help
+USAGE
+}
+
+user_add() {
+  local name="" key="" key_id="" requested="" replace=0
+  while (($#)); do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die "--name requires a value"; name=$2; shift 2 ;;
+      --key) [[ $# -ge 2 ]] || die "--key requires a value"; key=$2; shift 2 ;;
+      --key-id) [[ $# -ge 2 ]] || die "--key-id requires a value"; key_id=$2; shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      --replace) replace=1; shift ;;
+      -h|--help) user_add_usage; return 0 ;;
+      *) die "Unknown user-add option: $1" ;;
+    esac
+  done
+  [[ -n $name && -n $key ]] || die "--name and --key are required"
+  validate_simple_name "$name" "User name"
+  [[ -z $key_id ]] || validate_simple_name "$key_id" "Key ID"
+  validate_pubkey "$key"
+  local dir dest
+  dir=$(find_admin_dir "$requested")
+  if [[ -n $key_id ]]; then
+    dest="$dir/keydir/$key_id/$name.pub"
+  else
+    dest="$dir/keydir/$name.pub"
+  fi
+  if [[ -e $dest && $replace -ne 1 ]]; then
+    die "Key already exists: ${dest#"$dir/"} (use --replace to replace it)"
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$key" "$dest"
+  chmod 0644 "$dest"
+  git -C "$dir" add "${dest#"$dir/"}"
+  log "Staged key for Gitolite identity '$name': ${dest#"$dir/"}"
+}
+
+user_remove_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh user-remove --name USER [options]
+
+Options:
+  --name USER           Logical Gitolite identity (required)
+  --key-id ID           Remove only keydir/ID/USER.pub
+                        Without this, removes keydir/USER.pub only.
+  --admin-dir DIR       gitolite-admin working tree (default: current dir)
+  -h, --help
+USAGE
+}
+
+user_remove() {
+  local name="" key_id="" requested=""
+  while (($#)); do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die "--name requires a value"; name=$2; shift 2 ;;
+      --key-id) [[ $# -ge 2 ]] || die "--key-id requires a value"; key_id=$2; shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) user_remove_usage; return 0 ;;
+      *) die "Unknown user-remove option: $1" ;;
+    esac
+  done
+  [[ -n $name ]] || die "--name is required"
+  validate_simple_name "$name" "User name"
+  [[ -z $key_id ]] || validate_simple_name "$key_id" "Key ID"
+  local dir target
+  dir=$(find_admin_dir "$requested")
+  if [[ -n $key_id ]]; then target="$dir/keydir/$key_id/$name.pub"; else target="$dir/keydir/$name.pub"; fi
+  [[ -e $target ]] || die "Key not found: ${target#"$dir/"}"
+  git -C "$dir" rm -- "${target#"$dir/"}"
+  rmdir "$(dirname "$target")" 2>/dev/null || true
+}
+
+user_list_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh user-list [--admin-dir DIR]
+USAGE
+}
+
+user_list() {
+  local requested=""
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) user_list_usage; return 0 ;;
+      *) die "Unknown user-list option: $1" ;;
+    esac
+  done
+  local dir file rel user fp
+  need_cmd ssh-keygen
+  dir=$(find_admin_dir "$requested")
+  printf '%-24s %-36s %s\n' "USER" "KEY PATH" "FINGERPRINT"
+  while IFS= read -r -d '' file; do
+    rel=${file#"$dir/keydir/"}
+    user=$(basename "$file" .pub)
+    fp=$(ssh-keygen -lf "$file" 2>/dev/null | awk '{print $2}' || echo invalid)
+    printf '%-24s %-36s %s\n' "$user" "$rel" "$fp"
+  done < <(find "$dir/keydir" -type f -name '*.pub' -print0 | sort -z)
+}
+
+repo_set_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh repo-set --repo NAME --owner USER [options]
+
+Options:
+  --repo NAME            Repository name, e.g. project or team/project
+  --owner USER           Human/admin with RW+ to the whole repository
+  --writers LIST         Comma/space-separated users with RW (no force push)
+  --readers LIST         Comma/space-separated read-only users
+  --agents LIST          Comma/space-separated agents. Each gets:
+                           RW  agent/USER/*
+                           R   everywhere else
+  --protected-branch B   Exact branch protected from --writers/--agents.
+                         Repeat this option for multiple protected branches.
+  --admin-dir DIR        gitolite-admin working tree (default: current dir)
+  -h, --help
+
+This command declares the complete desired ACL state for a repository. Omitted
+writers, readers, agents, and protected branches are removed from the managed
+fragment. It writes conf/repos/<encoded-name>.conf and stages the change, but
+never pushes; run 'apply' after reviewing the staged diff.
+USAGE
+}
+
+repo_set() {
+  local repo="" owner="" writers="" readers="" agents="" requested=""
+  local -a protected_branches=()
+  while (($#)); do
+    case "$1" in
+      --repo) [[ $# -ge 2 ]] || die "--repo requires a value"; repo=$2; shift 2 ;;
+      --owner) [[ $# -ge 2 ]] || die "--owner requires a value"; owner=$2; shift 2 ;;
+      --writers) [[ $# -ge 2 ]] || die "--writers requires a value"; writers=$2; shift 2 ;;
+      --readers) [[ $# -ge 2 ]] || die "--readers requires a value"; readers=$2; shift 2 ;;
+      --agents) [[ $# -ge 2 ]] || die "--agents requires a value"; agents=$2; shift 2 ;;
+      --protected-branch) [[ $# -ge 2 ]] || die "--protected-branch requires a value"; protected_branches+=("$2"); shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) repo_set_usage; return 0 ;;
+      *) die "Unknown repo-set option: $1" ;;
+    esac
+  done
+  [[ -n $repo && -n $owner ]] || die "--repo and --owner are required"
+  validate_repo_name "$repo"
+  validate_simple_name "$owner" "Owner"
+  writers=$(csv_to_spaces "$writers")
+  readers=$(csv_to_spaces "$readers")
+  agents=$(csv_to_spaces "$agents")
+  validate_user_list "$writers"
+  validate_user_list "$readers"
+  validate_user_list "$agents"
+  local branch
+  for branch in "${protected_branches[@]}"; do
+    validate_branch_name "$branch"
+  done
+
+  local dir encoded fragment
+  dir=$(find_admin_dir "$requested")
+  mkdir -p "$dir/conf/repos"
+  if ! grep -Fqx 'include "repos/*.conf"' "$dir/conf/gitolite.conf"; then
+    die "Script-managed repo fragments are not enabled. Run 'admin-init' first."
+  fi
+  encoded=$(repo_fragment_name "$repo")
+  fragment="$dir/conf/repos/$encoded.conf"
+
+  {
+    printf '# Managed by mini-git-server.sh\n'
+    printf '# Repository: %s\n' "$repo"
+    printf '# mini-git-server: owner=%s\n' "$owner"
+    printf '# mini-git-server: writers=%s\n' "$writers"
+    printf '# mini-git-server: agents=%s\n' "$agents"
+    printf '# mini-git-server: readers=%s\n' "$readers"
+    for branch in "${protected_branches[@]}"; do
+      printf '# mini-git-server: protected-branch=%s\n' "$branch"
+    done
+    printf 'repo %s\n' "$repo"
+    printf '    RW+                         =   %s\n' "$owner"
+    if (( ${#protected_branches[@]} > 0 )) && [[ -n ${writers}${agents} ]]; then
+      local protected_users refex
+      protected_users=$(csv_to_spaces "$writers $agents")
+      for branch in "${protected_branches[@]}"; do
+        refex=$(branch_refex_exact "$branch")
+        printf '    -       %-20s =   %s\n' "$refex" "$protected_users"
+      done
+    fi
+    [[ -n $writers ]] && printf '    RW                          =   %s\n' "$writers"
+    if [[ -n $agents ]]; then
+      printf '    RW      agent/USER/         =   %s\n' "$agents"
+      local reader_sep=""
+      [[ -n $agents && -n $readers ]] && reader_sep=" "
+      printf '    R                           =   %s%s%s\n' "$agents" "$reader_sep" "$readers"
+    elif [[ -n $readers ]]; then
+      printf '    R                           =   %s\n' "$readers"
+    fi
+  } >"$fragment"
+
+  git -C "$dir" add "${fragment#"$dir/"}"
+  log "Staged repository ACL: ${fragment#"$dir/"}"
+}
+
+repo_add_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh repo-add --repo NAME --owner USER [options]
+
+'repo-add' is a backward-compatible alias for 'repo-set'.
+Run 'mini-git-server.sh repo-set --help' for the complete option list.
+USAGE
+}
+
+repo_add() {
+  if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    repo_add_usage
+    return 0
+  fi
+  repo_set "$@"
+}
+
+spaces_to_csv() {
+  local value=${1:-}
+  printf '%s\n' "$value" | awk '{$1=$1; gsub(/ /, ","); print}'
+}
+
+shell_quote() {
+  local value=$1
+  if [[ $value =~ ^[A-Za-z0-9_./,@%+=:-]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%q' "$value"
+  fi
+}
+
+regex_unescape_literal() {
+  local value=$1 out="" ch i escaped=0
+  for ((i=0; i<${#value}; i++)); do
+    ch=${value:i:1}
+    if (( escaped )); then
+      out+="$ch"
+      escaped=0
+    elif [[ $ch == $'\\' ]]; then
+      escaped=1
+    else
+      out+="$ch"
+    fi
+  done
+  (( escaped == 0 )) || out+=$'\\'
+  printf '%s' "$out"
+}
+
+repo_show_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh repo-show --repo NAME [options]
+
+Options:
+  --repo NAME       Repository name (required)
+  --admin-dir DIR   gitolite-admin working tree (default: current dir)
+  --raw             Print the managed Gitolite fragment exactly as stored
+  -h, --help
+
+By default, repo-show prints the current declarative ACL state and a reusable
+repo-set command that can be edited and run again. --raw preserves the old
+behavior of printing only the Gitolite fragment.
+USAGE
+}
+
+repo_show() {
+  local repo="" requested="" raw=0
+  while (($#)); do
+    case "$1" in
+      --repo) [[ $# -ge 2 ]] || die "--repo requires a value"; repo=$2; shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      --raw) raw=1; shift ;;
+      -h|--help) repo_show_usage; return 0 ;;
+      *) die "Unknown repo-show option: $1" ;;
+    esac
+  done
+  [[ -n $repo ]] || die "--repo is required"
+  validate_repo_name "$repo"
+  local dir fragment
+  dir=$(find_admin_dir "$requested")
+  fragment="$dir/conf/repos/$(repo_fragment_name "$repo").conf"
+  [[ -f $fragment ]] || die "Script-managed ACL not found for repository: $repo"
+
+  if (( raw )); then
+    cat "$fragment"
+    return 0
+  fi
+
+  local owner="" writers="" agents="" readers="" line value refex branch
+  local -a protected_branches=()
+
+  # Prefer explicit metadata written by repo-set. Fall back to parsing the
+  # legacy v0.2.x generated ACL format so existing fragments remain readable.
+  if grep -Fq '# mini-git-server: owner=' "$fragment"; then
+    while IFS= read -r line; do
+      case "$line" in
+        '# mini-git-server: owner='*) owner=${line#*=} ;;
+        '# mini-git-server: writers='*) writers=${line#*=} ;;
+        '# mini-git-server: agents='*) agents=${line#*=} ;;
+        '# mini-git-server: readers='*) readers=${line#*=} ;;
+        '# mini-git-server: protected-branch='*) protected_branches+=("${line#*=}") ;;
+      esac
+    done <"$fragment"
+  else
+    while IFS= read -r line; do
+      if [[ $line =~ ^[[:space:]]*RW\+[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        owner=${BASH_REMATCH[1]}
+      elif [[ $line =~ ^[[:space:]]*RW[[:space:]]+agent/USER/[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        agents=${BASH_REMATCH[1]}
+      elif [[ $line =~ ^[[:space:]]*RW[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        writers=${BASH_REMATCH[1]}
+      elif [[ $line =~ ^[[:space:]]*R[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        value=${BASH_REMATCH[1]}
+        readers=$value
+      elif [[ $line =~ ^[[:space:]]*-[[:space:]]+(refs/heads/.+\$)[[:space:]]*=[[:space:]]*.+$ ]]; then
+        refex=${BASH_REMATCH[1]}
+        refex=${refex#refs/heads/}
+        refex=${refex%$}
+        branch=$(regex_unescape_literal "$refex")
+        protected_branches+=("$branch")
+      fi
+    done <"$fragment"
+
+    # In generated legacy fragments the read rule contains agents first,
+    # followed by readers. Remove the agent identities to recover readers.
+    if [[ -n $agents && -n $readers ]]; then
+      local item filtered="" agent_item is_agent
+      local -a reader_items=() agent_items=()
+      IFS=' ' read -r -a reader_items <<<"$readers"
+      IFS=' ' read -r -a agent_items <<<"$agents"
+      for item in "${reader_items[@]}"; do
+        is_agent=0
+        for agent_item in "${agent_items[@]}"; do
+          [[ $item == "$agent_item" ]] && is_agent=1 && break
+        done
+        (( is_agent )) || filtered+="${filtered:+ }$item"
+      done
+      readers=$filtered
+    fi
+  fi
+
+  [[ -n $owner ]] || die "Unable to parse managed ACL owner for repository: $repo"
+
+  printf 'Repository: %s\n' "$repo"
+  printf 'Owner: %s\n' "$owner"
+  printf 'Writers: %s\n' "${writers:-(none)}"
+  printf 'Agents: %s\n' "${agents:-(none)}"
+  printf 'Readers: %s\n' "${readers:-(none)}"
+  printf 'Protected branches:'
+  if (( ${#protected_branches[@]} == 0 )); then
+    printf ' (none)\n'
+  else
+    printf '\n'
+    for branch in "${protected_branches[@]}"; do
+      printf '  - %s\n' "$branch"
+    done
+  fi
+
+  local -a cmd=("$0" repo-set --repo "$repo" --owner "$owner")
+  [[ -n $writers ]] && cmd+=(--writers "$(spaces_to_csv "$writers")")
+  [[ -n $agents ]] && cmd+=(--agents "$(spaces_to_csv "$agents")")
+  [[ -n $readers ]] && cmd+=(--readers "$(spaces_to_csv "$readers")")
+  for branch in "${protected_branches[@]}"; do
+    cmd+=(--protected-branch "$branch")
+  done
+  [[ -n $requested ]] && cmd+=(--admin-dir "$dir")
+
+  printf '\nReapply command:\n'
+  shell_quote "${cmd[0]}"
+  printf ' '
+  shell_quote "${cmd[1]}"
+  local i
+  for ((i=2; i<${#cmd[@]}; i+=2)); do
+    printf ' \\\n  '
+    shell_quote "${cmd[i]}"
+    printf ' '
+    shell_quote "${cmd[i+1]}"
+  done
+  printf '\n'
+}
+
+repo_list_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh repo-list [--admin-dir DIR]
+USAGE
+}
+
+repo_list() {
+  local requested=""
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) repo_list_usage; return 0 ;;
+      *) die "Unknown repo-list option: $1" ;;
+    esac
+  done
+  local dir
+  dir=$(find_admin_dir "$requested")
+  grep -RhsE '^[[:space:]]*repo[[:space:]]+' "$dir/conf" \
+    | sed -E 's/^[[:space:]]*repo[[:space:]]+//' \
+    | awk '{for (i=1;i<=NF;i++) print $i}' \
+    | sort -u
+}
+
+apply_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh apply [options]
+
+Options:
+  --admin-dir DIR       gitolite-admin working tree (default: current dir)
+  -m, --message TEXT    Commit message (default: 'Update Gitolite configuration')
+  --no-push             Commit locally but do not push
+  -h, --help
+
+The command shows the staged diff, runs 'git diff --check', commits it, and
+pushes to origin unless --no-push is used.
+USAGE
+}
+
+admin_apply() {
+  local requested="" message="Update Gitolite configuration" push=1
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -m|--message) [[ $# -ge 2 ]] || die "$1 requires a value"; message=$2; shift 2 ;;
+      --no-push) push=0; shift ;;
+      -h|--help) apply_usage; return 0 ;;
+      *) die "Unknown apply option: $1" ;;
+    esac
+  done
+  local dir
+  dir=$(find_admin_dir "$requested")
+  git -C "$dir" diff --check --cached
+  if git -C "$dir" diff --cached --quiet; then
+    die "No staged changes to apply."
+  fi
+
+  printf '%s\n' '--- staged changes ---'
+  git -C "$dir" diff --cached --stat
+  git -C "$dir" diff --cached
+  printf '%s\n' '--- end staged changes ---'
+
+  git -C "$dir" commit -m "$message"
+  if (( push )); then
+    git -C "$dir" push origin HEAD
+    log "Changes pushed to Gitolite."
+  else
+    log "Committed locally; push skipped by --no-push."
+  fi
+}
+
+main() {
+  local cmd=${1:-help}
+  [[ $# -eq 0 ]] || shift
+  case "$cmd" in
+    install)      server_install "$@" ;;
+    status)       server_status "$@" ;;
+    doctor)       server_doctor "$@" ;;
+    backup)       server_backup "$@" ;;
+    fsck)         server_fsck "$@" ;;
+    repo-set-default) server_repo_set_default "$@" ;;
+    admin-clone)  admin_clone "$@" ;;
+    admin-init)   admin_init "$@" ;;
+    user-add)     user_add "$@" ;;
+    user-remove)  user_remove "$@" ;;
+    user-list)    user_list "$@" ;;
+    repo-set)     repo_set "$@" ;;
+    repo-add)     repo_add "$@" ;;
+    repo-show)    repo_show "$@" ;;
+    repo-list)    repo_list "$@" ;;
+    apply)        admin_apply "$@" ;;
+    version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "Unknown command: $cmd" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
