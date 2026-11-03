@@ -61,7 +61,7 @@ new_tmp() {
 new_admin_repo() {
   local dir=$1
   mkdir -p "$dir/conf" "$dir/keydir"
-  git -C "$dir" init -q
+  git -C "$dir" init -q -b master
   git -C "$dir" config user.name "Test User"
   git -C "$dir" config user.email "test@example.invalid"
   cat > "$dir/conf/gitolite.conf" <<'CONF'
@@ -356,6 +356,36 @@ test_apply_no_push_commits_staged_changes() {
   assert_eq 'Initialize managed ACLs' "$(git -C "$repo" log -1 --format=%s)"
 }
 
+test_apply_refuses_branch_other_than_master() {
+  local tmp repo before out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  git -C "$repo" switch -q -c trunk
+  before=$(git -C "$repo" rev-parse HEAD)
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null
+
+  if out=$("$SCRIPT" apply --admin-dir "$repo" --no-push -m 'wrong branch' 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "only applies changes pushed to 'master'"
+  assert_eq "$before" "$(git -C "$repo" rev-parse HEAD)" 'apply must not commit on the wrong branch'
+}
+
+test_apply_refuses_detached_head() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  git -C "$repo" switch -q --detach
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null
+
+  if out=$("$SCRIPT" apply --admin-dir "$repo" --no-push 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'detached HEAD'
+}
+
 test_repo_set_default_unborn_branch() {
   local tmp home bare actual
   tmp=$(new_tmp)
@@ -419,6 +449,34 @@ test_repo_set_default_require_existing_rejects_missing() {
   fi
 }
 
+test_repo_set_default_keeps_admin_repo_on_master() {
+  local tmp home bare out
+  tmp=$(new_tmp)
+  home="$tmp/git-home"
+  bare="$home/repositories/gitolite-admin.git"
+  mkdir -p "$(dirname "$bare")"
+  git init --bare -q -b master "$bare"
+
+  if out=$(
+    # shellcheck source=/dev/null
+    source "$SCRIPT"
+    require_root() { :; }
+    id() { return 0; }
+    getent() {
+      printf 'git:x:1000:1000::%s:/usr/bin/git-shell\n' "$home"
+    }
+    runuser() {
+      shift 3
+      "$@"
+    }
+    server_repo_set_default --repo gitolite-admin --branch trunk --git-user git 2>&1
+  ); then
+    return 1
+  fi
+  assert_contains "$out" "gitolite-admin must use the 'master' branch"
+  assert_eq 'refs/heads/master' "$(git -C "$bare" symbolic-ref HEAD)"
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -434,8 +492,11 @@ run_test 'repo-show parses legacy managed fragments' test_repo_show_parses_legac
 run_test 'multiple device keys map to one logical user' test_multi_device_user_key_layout
 run_test 'repo-list includes managed repository fragments' test_repo_list_includes_fragments
 run_test 'apply --no-push commits staged admin changes' test_apply_no_push_commits_staged_changes
+run_test 'apply refuses a branch other than master' test_apply_refuses_branch_other_than_master
+run_test 'apply refuses a detached HEAD' test_apply_refuses_detached_head
 run_test 'repo-set-default supports an unborn branch' test_repo_set_default_unborn_branch
 run_test 'repo-set-default --require-existing rejects a missing branch' test_repo_set_default_require_existing_rejects_missing
+run_test 'repo-set-default keeps gitolite-admin on master' test_repo_set_default_keeps_admin_repo_on_master
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

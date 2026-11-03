@@ -8,6 +8,10 @@ DEFAULT_GIT_USER="git"
 DEFAULT_SSH_PORT="22"
 DEFAULT_SSHD_DROPIN="/etc/ssh/sshd_config.d/90-gitolite.conf"
 DEFAULT_SSHD_PORT_DROPIN="/etc/ssh/sshd_config.d/00-gitolite-port.conf"
+# Gitolite 3.6.12 (the Debian 13 package) only compiles pushes to this branch
+# of gitolite-admin. Newer upstream releases follow the admin repository HEAD,
+# which also works as long as HEAD points here.
+GITOLITE_ADMIN_BRANCH="master"
 
 log()  { printf '[INFO] %s\n' "$*" >&2; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -183,6 +187,59 @@ Notes:
 USAGE
 }
 
+# Create the hosting account if needed, then initialize Gitolite for it.
+# Arguments: GIT_USER ADMIN_KEY ADMIN_NAME DEFAULT_BRANCH (may be empty).
+init_hosting_account() {
+  local git_user=$1 admin_key=$2 admin_name=$3 default_branch=$4
+  local git_home
+  if id "$git_user" >/dev/null 2>&1; then
+    git_home=$(getent passwd "$git_user" | cut -d: -f6)
+    [[ -n $git_home ]] || die "Cannot determine home directory for user: $git_user"
+  else
+    git_home="/home/$git_user"
+    log "Creating dedicated hosting account: $git_user"
+    useradd --create-home --home-dir "$git_home" --shell /bin/bash "$git_user"
+  fi
+
+  passwd -l "$git_user" >/dev/null 2>&1 || true
+  install -d -m 0700 -o "$git_user" -g "$git_user" "$git_home/.ssh"
+
+  if [[ -e "$git_home/.gitolite" || -e "$git_home/repositories/gitolite-admin.git" ]]; then
+    die "Gitolite already appears initialized for $git_user at $git_home; refusing to overwrite it."
+  fi
+
+  if [[ -s "$git_home/.ssh/authorized_keys" ]]; then
+    die "$git_home/.ssh/authorized_keys is not empty. Use a fresh hosting account or migrate carefully."
+  fi
+
+  local temp_key="$git_home/${admin_name}.pub"
+  install -m 0600 -o "$git_user" -g "$git_user" "$admin_key" "$temp_key"
+
+  # Pin init.defaultBranch for setup only. Otherwise --default-branch, or an
+  # init.defaultBranch already set for this account or system-wide, would put
+  # gitolite-admin on a branch that Gitolite never compiles. GIT_CONFIG_COUNT
+  # overrides both the global and the system Git configuration.
+  log "Initializing Gitolite as '$git_user' with admin identity '$admin_name'"
+  runuser -u "$git_user" -- env HOME="$git_home" \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=init.defaultBranch \
+    GIT_CONFIG_VALUE_0="$GITOLITE_ADMIN_BRANCH" \
+    gitolite setup -pk "$temp_key"
+  rm -f "$temp_key"
+
+  local admin_head
+  admin_head=$(runuser -u "$git_user" -- git -C "$git_home/repositories/gitolite-admin.git" symbolic-ref HEAD)
+  [[ $admin_head == "refs/heads/$GITOLITE_ADMIN_BRANCH" ]] || \
+    die "gitolite-admin HEAD is '$admin_head', expected 'refs/heads/$GITOLITE_ADMIN_BRANCH'. Gitolite would ignore admin pushes."
+
+  # Set the default branch only after setup, so it affects repositories
+  # created later (through gitolite-admin) but never gitolite-admin itself.
+  if [[ -n $default_branch ]]; then
+    log "Setting Git default branch for new repositories to '$default_branch'"
+    runuser -u "$git_user" -- env HOME="$git_home" git config --global init.defaultBranch "$default_branch"
+  fi
+}
+
 server_install() {
   require_root
   local admin_key="" admin_name="admin" git_user=$DEFAULT_GIT_USER ssh_port=$DEFAULT_SSH_PORT
@@ -264,38 +321,9 @@ EOF_PORT
   fi
   [[ -z $previous_port_dropin ]] || rm -f "$previous_port_dropin"
 
+  init_hosting_account "$git_user" "$admin_key" "$admin_name" "$default_branch"
   local git_home
-  if id "$git_user" >/dev/null 2>&1; then
-    git_home=$(getent passwd "$git_user" | cut -d: -f6)
-    [[ -n $git_home ]] || die "Cannot determine home directory for user: $git_user"
-  else
-    git_home="/home/$git_user"
-    log "Creating dedicated hosting account: $git_user"
-    useradd --create-home --home-dir "$git_home" --shell /bin/bash "$git_user"
-  fi
-
-  passwd -l "$git_user" >/dev/null 2>&1 || true
-  install -d -m 0700 -o "$git_user" -g "$git_user" "$git_home/.ssh"
-
-  if [[ -n $default_branch ]]; then
-    log "Setting Git default branch for new repositories to '$default_branch'"
-    runuser -u "$git_user" -- env HOME="$git_home" git config --global init.defaultBranch "$default_branch"
-  fi
-
-  if [[ -e "$git_home/.gitolite" || -e "$git_home/repositories/gitolite-admin.git" ]]; then
-    die "Gitolite already appears initialized for $git_user at $git_home; refusing to overwrite it."
-  fi
-
-  if [[ -s "$git_home/.ssh/authorized_keys" ]]; then
-    die "$git_home/.ssh/authorized_keys is not empty. Use a fresh hosting account or migrate carefully."
-  fi
-
-  local temp_key="$git_home/${admin_name}.pub"
-  install -m 0600 -o "$git_user" -g "$git_user" "$admin_key" "$temp_key"
-
-  log "Initializing Gitolite as '$git_user' with admin identity '$admin_name'"
-  runuser -u "$git_user" -- env HOME="$git_home" gitolite setup -pk "$temp_key"
-  rm -f "$temp_key"
+  git_home=$(getent passwd "$git_user" | cut -d: -f6)
 
   if (( harden )); then
     install -d -m 0755 /etc/ssh/sshd_config.d
@@ -439,6 +467,15 @@ server_doctor() {
   fi
   if [[ -d "$git_home/repositories/gitolite-admin.git" ]]; then
     check_ok "gitolite-admin repository exists"
+    local admin_repo="$git_home/repositories/gitolite-admin.git" admin_head
+    admin_head=$(runuser -u "$git_user" -- git -C "$admin_repo" symbolic-ref --quiet HEAD 2>/dev/null || true)
+    if [[ $admin_head != "refs/heads/$GITOLITE_ADMIN_BRANCH" ]]; then
+      check_bad "gitolite-admin HEAD is '${admin_head:-unknown}', expected refs/heads/$GITOLITE_ADMIN_BRANCH; Gitolite ignores admin pushes (see README: Repair an admin repository on the wrong branch)"
+    elif ! runuser -u "$git_user" -- git -C "$admin_repo" show-ref --verify --quiet "refs/heads/$GITOLITE_ADMIN_BRANCH"; then
+      check_bad "gitolite-admin has no '$GITOLITE_ADMIN_BRANCH' branch yet (see README: Repair an admin repository on the wrong branch)"
+    else
+      check_ok "gitolite-admin uses the '$GITOLITE_ADMIN_BRANCH' branch"
+    fi
   else
     check_bad "gitolite-admin repository is missing"
   fi
@@ -665,6 +702,9 @@ server_repo_set_default() {
   validate_repo_name "$repo"
   validate_branch_name "$branch"
   validate_unix_user "$git_user"
+  if [[ $repo == gitolite-admin && $branch != "$GITOLITE_ADMIN_BRANCH" ]]; then
+    die "gitolite-admin must use the '$GITOLITE_ADMIN_BRANCH' branch; Gitolite ignores pushes to any other branch of it."
+  fi
   id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
 
   local git_home path
@@ -1194,7 +1234,8 @@ Options:
   -h, --help
 
 The command shows the staged diff, runs 'git diff --check', commits it, and
-pushes to origin unless --no-push is used.
+pushes it to the 'master' branch of origin unless --no-push is used. It must
+run on the local 'master' branch, because Gitolite only applies that branch.
 USAGE
 }
 
@@ -1209,8 +1250,14 @@ admin_apply() {
       *) die "Unknown apply option: $1" ;;
     esac
   done
-  local dir
+  local dir branch
   dir=$(find_admin_dir "$requested")
+  # Check the branch before committing, so nothing is committed to a branch
+  # that Gitolite would silently ignore.
+  branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD) || \
+    die "gitolite-admin has a detached HEAD. Run 'git switch $GITOLITE_ADMIN_BRANCH' first."
+  [[ $branch == "$GITOLITE_ADMIN_BRANCH" ]] || \
+    die "gitolite-admin is on branch '$branch', but Gitolite only applies changes pushed to '$GITOLITE_ADMIN_BRANCH'. Switch to '$GITOLITE_ADMIN_BRANCH', or see 'Repair an admin repository on the wrong branch' in README.md."
   git -C "$dir" diff --check --cached
   if git -C "$dir" diff --cached --quiet; then
     die "No staged changes to apply."
@@ -1223,7 +1270,7 @@ admin_apply() {
 
   git -C "$dir" commit -m "$message"
   if (( push )); then
-    git -C "$dir" push origin HEAD
+    git -C "$dir" push origin "HEAD:refs/heads/$GITOLITE_ADMIN_BRANCH"
     log "Changes pushed to Gitolite."
   else
     log "Committed locally; push skipped by --no-push."

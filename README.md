@@ -93,6 +93,12 @@ The installer:
 
 `--ssh-port` now **configures sshd**, rather than being informational only.
 
+`--default-branch` only affects repositories created after installation. The
+`gitolite-admin` repository always uses the `master` branch, because Gitolite
+3.6.12 (the Debian 13 package) only applies pushes to `master` of
+`gitolite-admin`. The installer pins this branch during `gitolite setup` and
+stops if the admin repository ends up on any other branch.
+
 The script does not modify nftables/iptables, a cloud firewall, router ACLs, or VPN policy. If a non-default SSH port is used, make sure that port is reachable before ending the current administrative session.
 
 If another active `Port` directive already exists elsewhere in the sshd configuration, the script warns that sshd may listen on more than one port. The installer is intended primarily for a fresh Debian host.
@@ -371,6 +377,10 @@ HEAD -> refs/heads/trunk
 
 An empty repository is allowed to point to an unborn branch, which is useful before the first push.
 
+`gitolite-admin` is the exception: `repo-set-default` only accepts `master`
+for it, because Gitolite ignores pushes to any other branch of the admin
+repository.
+
 If the branch must already exist:
 
 ```bash
@@ -405,16 +415,57 @@ Review and deploy them with:
 
 `apply`:
 
-1. runs `git diff --check --cached`;
-2. displays the staged diff;
-3. commits the change;
-4. pushes `gitolite-admin` to `origin`.
+1. checks that the working tree is on the `master` branch;
+2. runs `git diff --check --cached`;
+3. displays the staged diff;
+4. commits the change;
+5. pushes it to `master` on `origin`.
 
 To commit without pushing:
 
 ```bash
 /path/to/mini-git-server.sh apply --no-push
 ```
+
+`apply` refuses to run on any branch other than `master`. Gitolite ignores
+pushes to other branches of `gitolite-admin`, so such a push would succeed
+without changing any access rules.
+
+### Repair an admin repository on the wrong branch
+
+Earlier versions of `install --default-branch NAME` created `gitolite-admin`
+on branch `NAME` instead of `master`. On such a server every push to
+`gitolite-admin` succeeds, but Gitolite never applies it: new keys and
+repositories do not appear. `doctor` reports this as a failure, and `apply`
+refuses to run on that branch.
+
+To repair it, first point the admin repository at `master` on the server:
+
+```bash
+sudo ./mini-git-server.sh repo-set-default \
+  --repo gitolite-admin \
+  --branch master
+```
+
+Then, inside the `gitolite-admin` working tree on the admin workstation,
+rename the local branch and push it. This push makes Gitolite apply the
+configuration:
+
+```bash
+git fetch origin
+git branch -m master
+git push -u origin master
+```
+
+Optionally remove the old branch from the server, replacing `trunk` with the
+branch name that was used:
+
+```bash
+git push origin --delete trunk
+```
+
+Check the result with `ssh internal-git info` on the workstation and
+`sudo ./mini-git-server.sh doctor` on the server.
 
 ## 9. Agent workflow
 
