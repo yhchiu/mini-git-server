@@ -42,6 +42,7 @@ Admin-workstation commands (run inside or against a gitolite-admin clone):
   repo-add        Alias for repo-set (backward compatibility)
   repo-show       Show repository ACL state and a reusable repo-set command
   repo-list       List configured repositories
+  sync            Update gitolite-admin from origin, keeping staged changes
   apply           Review, commit and push gitolite-admin changes
 
 Other:
@@ -1446,6 +1447,103 @@ repo_list() {
     | sort -u
 }
 
+# Stop unless the gitolite-admin working tree is on the branch that Gitolite
+# applies.
+require_admin_branch() {
+  local dir=$1 branch
+  branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD) || \
+    die "gitolite-admin has a detached HEAD. Run 'git switch $GITOLITE_ADMIN_BRANCH' first."
+  [[ $branch == "$GITOLITE_ADMIN_BRANCH" ]] || \
+    die "gitolite-admin is on branch '$branch', but Gitolite only applies changes pushed to '$GITOLITE_ADMIN_BRANCH'. Switch to '$GITOLITE_ADMIN_BRANCH', or see 'Repair an admin repository on the wrong branch' in README.md."
+}
+
+# Fetch the admin branch from origin, then print how HEAD relates to it:
+# up-to-date, ahead, behind or diverged.
+admin_remote_state() {
+  local dir=$1 remote_ref="refs/remotes/origin/$GITOLITE_ADMIN_BRANCH" head remote
+  git -C "$dir" fetch --quiet origin "+refs/heads/$GITOLITE_ADMIN_BRANCH:$remote_ref" || \
+    die "Could not fetch '$GITOLITE_ADMIN_BRANCH' from origin."
+  head=$(git -C "$dir" rev-parse HEAD)
+  remote=$(git -C "$dir" rev-parse "$remote_ref")
+  if [[ $head == "$remote" ]]; then
+    printf 'up-to-date\n'
+  elif git -C "$dir" merge-base --is-ancestor "$remote" "$head"; then
+    printf 'ahead\n'
+  elif git -C "$dir" merge-base --is-ancestor "$head" "$remote"; then
+    printf 'behind\n'
+  else
+    printf 'diverged\n'
+  fi
+}
+
+admin_tree_clean() {
+  git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet
+}
+
+admin_sync_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh sync [--admin-dir DIR]
+
+Bring the gitolite-admin working tree up to date with origin, for example
+after another machine applied changes:
+
+  - behind origin: fast-forward, keeping staged changes that were not
+    applied yet;
+  - local commits that were not pushed (for example after a failed push):
+    rebase them onto origin.
+
+sync never pushes. Run 'apply' (or 'git push origin master') afterwards.
+USAGE
+}
+
+admin_sync() {
+  local requested=""
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) admin_sync_usage; return 0 ;;
+      *) die "Unknown sync option: $1" ;;
+    esac
+  done
+  local dir state remote_ref="refs/remotes/origin/$GITOLITE_ADMIN_BRANCH" ahead
+  dir=$(find_admin_dir "$requested")
+  require_admin_branch "$dir"
+  state=$(admin_remote_state "$dir")
+  case $state in
+    up-to-date)
+      log "gitolite-admin is up to date with origin."
+      ;;
+    ahead)
+      ahead=$(git -C "$dir" rev-list --count "$remote_ref..HEAD")
+      log "gitolite-admin is up to date, with $ahead local commit(s) not pushed yet. Push them with: git -C '$dir' push origin $GITOLITE_ADMIN_BRANCH"
+      ;;
+    behind)
+      if admin_tree_clean "$dir"; then
+        git -C "$dir" merge --ff-only --quiet "$remote_ref"
+      else
+        git -C "$dir" stash push --quiet -m "mini-git-server sync"
+        if ! git -C "$dir" merge --ff-only --quiet "$remote_ref"; then
+          git -C "$dir" stash pop --index --quiet || true
+          die "Could not fast-forward to origin (see the Git message above). Nothing was changed."
+        fi
+        if ! git -C "$dir" stash pop --index --quiet; then
+          die "Updated to origin, but your staged changes conflict with the new changes. They are saved as the latest entry in 'git -C $dir stash list'. Run 'git -C $dir reset --hard', redo the changes with the mini-git-server commands, then 'git -C $dir stash drop'."
+        fi
+      fi
+      log "Updated gitolite-admin to origin/$GITOLITE_ADMIN_BRANCH. Staged changes were kept."
+      ;;
+    diverged)
+      admin_tree_clean "$dir" || \
+        die "Both origin and your local commits changed, and there are also uncommitted changes. Commit them with 'apply --no-push' or remove them, then run sync again."
+      if ! git -C "$dir" rebase --quiet "$remote_ref"; then
+        die "Rebase stopped on a conflict. Resolve it and run 'git -C $dir rebase --continue', or undo it with 'git -C $dir rebase --abort'."
+      fi
+      log "Rebased local commits onto origin/$GITOLITE_ADMIN_BRANCH. Push them with: git -C '$dir' push origin $GITOLITE_ADMIN_BRANCH"
+      ;;
+  esac
+}
+
 apply_usage() {
   cat <<'USAGE'
 Usage:
@@ -1460,6 +1558,9 @@ Options:
 The command shows the staged diff, runs 'git diff --check', commits it, and
 pushes it to the 'master' branch of origin unless --no-push is used. It must
 run on the local 'master' branch, because Gitolite only applies that branch.
+
+Before committing, apply fetches origin. If another machine has pushed newer
+changes, it stops without committing; run 'sync' and then apply again.
 USAGE
 }
 
@@ -1474,17 +1575,24 @@ admin_apply() {
       *) die "Unknown apply option: $1" ;;
     esac
   done
-  local dir branch
+  local dir state
   dir=$(find_admin_dir "$requested")
   # Check the branch before committing, so nothing is committed to a branch
   # that Gitolite would silently ignore.
-  branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD) || \
-    die "gitolite-admin has a detached HEAD. Run 'git switch $GITOLITE_ADMIN_BRANCH' first."
-  [[ $branch == "$GITOLITE_ADMIN_BRANCH" ]] || \
-    die "gitolite-admin is on branch '$branch', but Gitolite only applies changes pushed to '$GITOLITE_ADMIN_BRANCH'. Switch to '$GITOLITE_ADMIN_BRANCH', or see 'Repair an admin repository on the wrong branch' in README.md."
+  require_admin_branch "$dir"
   git -C "$dir" diff --check --cached
   if git -C "$dir" diff --cached --quiet; then
     die "No staged changes to apply."
+  fi
+  # Do not commit on top of an old state: the push would be rejected and
+  # leave a local commit behind.
+  if (( push )); then
+    state=$(admin_remote_state "$dir")
+    case $state in
+      behind|diverged)
+        die "origin has newer gitolite-admin changes (for example from another machine). Nothing was committed. Run '$PROGRAM sync', check 'git diff --cached' again, then run apply again."
+        ;;
+    esac
   fi
 
   printf '%s\n' '--- staged changes ---'
@@ -1494,7 +1602,9 @@ admin_apply() {
 
   git -C "$dir" commit -m "$message"
   if (( push )); then
-    git -C "$dir" push origin "HEAD:refs/heads/$GITOLITE_ADMIN_BRANCH"
+    if ! git -C "$dir" push origin "HEAD:refs/heads/$GITOLITE_ADMIN_BRANCH"; then
+      die "Push failed, but the change is committed locally. Run '$PROGRAM sync', then push with: git -C '$dir' push origin $GITOLITE_ADMIN_BRANCH"
+    fi
     log "Changes pushed to Gitolite."
   else
     log "Committed locally; push skipped by --no-push."
@@ -1520,6 +1630,7 @@ main() {
     repo-add)     repo_add "$@" ;;
     repo-show)    repo_show "$@" ;;
     repo-list)    repo_list "$@" ;;
+    sync)         admin_sync "$@" ;;
     apply)        admin_apply "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|-h|--help) usage ;;

@@ -680,6 +680,70 @@ test_repo_set_warns_about_identities_without_keys() {
   assert_not_contains "$out" "No key in keydir for 'arthur'"
 }
 
+# Create TMP/origin.git (with admin-init applied) and two working trees,
+# TMP/desktop and TMP/laptop, as if on two machines.
+new_admin_origin_with_two_clones() {
+  local tmp=$1 clone
+  new_admin_repo "$tmp/seed"
+  "$SCRIPT" admin-init --admin-dir "$tmp/seed" >/dev/null 2>&1
+  git -C "$tmp/seed" commit -qm 'admin-init'
+  git clone -q --bare "$tmp/seed" "$tmp/origin.git"
+  for clone in desktop laptop; do
+    git clone -q "$tmp/origin.git" "$tmp/$clone"
+    git -C "$tmp/$clone" config user.name "Test User"
+    git -C "$tmp/$clone" config user.email "test@example.invalid"
+  done
+}
+
+test_apply_stops_when_behind_and_sync_keeps_staged_changes() {
+  local tmp before out
+  tmp=$(new_tmp)
+  new_admin_origin_with_two_clones "$tmp"
+
+  "$SCRIPT" repo-set --admin-dir "$tmp/desktop" --repo alpha --owner arthur >/dev/null 2>&1
+  "$SCRIPT" apply --admin-dir "$tmp/desktop" -m 'Add alpha' >/dev/null 2>&1
+
+  "$SCRIPT" repo-set --admin-dir "$tmp/laptop" --repo beta --owner arthur >/dev/null 2>&1
+  before=$(git -C "$tmp/laptop" rev-parse HEAD)
+  if out=$("$SCRIPT" apply --admin-dir "$tmp/laptop" -m 'Add beta' 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'Nothing was committed'
+  assert_contains "$out" 'sync'
+  assert_eq "$before" "$(git -C "$tmp/laptop" rev-parse HEAD)" 'apply must not commit when behind'
+
+  "$SCRIPT" sync --admin-dir "$tmp/laptop" >/dev/null 2>&1
+  assert_eq "$(git -C "$tmp/origin.git" rev-parse master)" "$(git -C "$tmp/laptop" rev-parse HEAD)"
+  assert_eq 'conf/repos/beta.conf' "$(git -C "$tmp/laptop" diff --cached --name-only)" 'sync must keep staged changes'
+
+  "$SCRIPT" apply --admin-dir "$tmp/laptop" -m 'Add beta' >/dev/null 2>&1
+  out=$(git -C "$tmp/origin.git" ls-tree -r --name-only master conf/repos)
+  assert_contains "$out" 'conf/repos/alpha.conf'
+  assert_contains "$out" 'conf/repos/beta.conf'
+}
+
+test_sync_rebases_unpushed_commits() {
+  local tmp out
+  tmp=$(new_tmp)
+  new_admin_origin_with_two_clones "$tmp"
+
+  "$SCRIPT" repo-set --admin-dir "$tmp/laptop" --repo gamma --owner arthur >/dev/null 2>&1
+  "$SCRIPT" apply --admin-dir "$tmp/laptop" --no-push -m 'Add gamma' >/dev/null 2>&1
+  "$SCRIPT" repo-set --admin-dir "$tmp/desktop" --repo delta --owner arthur >/dev/null 2>&1
+  "$SCRIPT" apply --admin-dir "$tmp/desktop" -m 'Add delta' >/dev/null 2>&1
+
+  out=$("$SCRIPT" sync --admin-dir "$tmp/laptop" 2>&1)
+  assert_contains "$out" 'Rebased local commits'
+  git -C "$tmp/laptop" merge-base --is-ancestor origin/master HEAD
+  git -C "$tmp/laptop" push -q origin master
+  out=$(git -C "$tmp/origin.git" ls-tree -r --name-only master conf/repos)
+  assert_contains "$out" 'conf/repos/gamma.conf'
+  assert_contains "$out" 'conf/repos/delta.conf'
+
+  out=$("$SCRIPT" sync --admin-dir "$tmp/laptop" 2>&1)
+  assert_contains "$out" 'up to date'
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -711,6 +775,8 @@ run_test 'user-remove --all removes every key and warns about remaining ACL entr
 run_test 'repo-set rejects an identity with two roles' test_repo_set_rejects_identity_with_two_roles
 run_test 'repo-set rejects agent names with special characters' test_repo_set_rejects_agent_names_with_special_characters
 run_test 'repo-set warns about identities without keys' test_repo_set_warns_about_identities_without_keys
+run_test 'apply stops when origin is newer, and sync keeps staged changes' test_apply_stops_when_behind_and_sync_keeps_staged_changes
+run_test 'sync rebases local commits that were not pushed' test_sync_rebases_unpushed_commits
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

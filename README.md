@@ -46,6 +46,7 @@ repo-set
 repo-add (compatibility alias)
 repo-show
 repo-list
+sync
 apply
 ```
 
@@ -482,9 +483,11 @@ Review and deploy them with:
 
 1. checks that the working tree is on the `master` branch;
 2. runs `git diff --check --cached`;
-3. displays the staged diff;
-4. commits the change;
-5. pushes it to `master` on `origin`.
+3. fetches `origin` and stops, without committing, if another machine has
+   pushed newer changes;
+4. displays the staged diff;
+5. commits the change;
+6. pushes it to `master` on `origin`.
 
 To commit without pushing:
 
@@ -495,6 +498,30 @@ To commit without pushing:
 `apply` refuses to run on any branch other than `master`. Gitolite ignores
 pushes to other branches of `gitolite-admin`, so such a push would succeed
 without changing any access rules.
+
+### Working from several machines
+
+Each admin workstation has its own `gitolite-admin` working tree. When
+another machine has applied changes in the meantime, `apply` stops before
+committing. Bring the working tree up to date and apply again:
+
+```bash
+/path/to/mini-git-server.sh sync
+/path/to/mini-git-server.sh apply -m "Add project-y"
+```
+
+`sync`:
+
+- fast-forwards to `origin`, keeping changes that are staged but not
+  applied yet;
+- rebases local commits that were not pushed (for example after a failed
+  push, or `apply --no-push`) onto `origin`;
+- never pushes.
+
+`repo-set` writes the complete ACL of a repository. If another machine
+changed the same repository, check the staged diff after `sync`, or simply
+run the `repo-set` command again on top of the updated state. Running `sync`
+before starting a change avoids this.
 
 ### Repair an admin repository on the wrong branch
 

@@ -283,6 +283,26 @@ test_gitolite_enforces_agent_acl() {
   expect_push deny admin 'HEAD:refs/heads/admin-test'
 }
 
+test_two_admin_machines_with_sync() {
+  local laptop="$TMP/gitolite-admin-laptop" out
+  client git clone --quiet as-admin:gitolite-admin "$laptop"
+
+  client "$SCRIPT" repo-set --admin-dir "$ADMIN" --repo from-desktop --owner arthur
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Add from-desktop'
+
+  client "$SCRIPT" repo-set --admin-dir "$laptop" --repo from-laptop --owner arthur
+  if out=$(client "$SCRIPT" apply --admin-dir "$laptop" -m 'Add from-laptop' 2>&1); then
+    printf '  apply pushed from an out-of-date working tree\n'
+    return 1
+  fi
+  printf '%s\n' "$out"
+  assert_contains "$out" 'Nothing was committed'
+
+  client "$SCRIPT" sync --admin-dir "$laptop"
+  client "$SCRIPT" apply --admin-dir "$laptop" -m 'Add from-laptop'
+  [[ -d "$GL_HOME/repositories/from-desktop.git" && -d "$GL_HOME/repositories/from-laptop.git" ]]
+}
+
 test_fsck_checks_every_repository() {
   "$SCRIPT" fsck --git-user "$GL_USER"
 }
@@ -340,6 +360,7 @@ step 'doctor lints authorized_keys when stdin is not a terminal' test_doctor_lin
 step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_applied
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
+step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync
 step 'fsck checks every repository' test_fsck_checks_every_repository
 step 'backup mirrors every repository as root' test_backup_mirrors_every_repository
 step 'doctor detects a wrong admin branch and repo-set-default repairs it' test_doctor_detects_and_repo_set_default_repairs_admin_branch
