@@ -563,3 +563,18 @@ Run syntax checks, ShellCheck when installed, and the full test suite:
 make check
 ```
 
+Run the integration tests against a real Gitolite installation. They need
+root and the `gitolite3` package:
+
+```bash
+sudo make test-integration
+```
+
+The integration tests create a temporary hosting account and remove it
+afterwards. They do not start sshd or change the SSH configuration:
+`tests/fake-ssh` runs each key's forced command from the Gitolite
+`authorized_keys` file, the same way sshd would. They cover installation
+with `--default-branch`, the admin workflow, the generated ACL (with real
+pushes), `status`, `doctor`, `fsck` and `backup`. Run them on a disposable
+machine or container rather than a production Git server.
+

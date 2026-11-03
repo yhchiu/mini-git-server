@@ -10,6 +10,14 @@ make check
 
 The test suite is intentionally written in Bash and does not require Bats or another test framework. `shellcheck` is optional locally; GitHub Actions installs it in CI.
 
+Changes to server commands, generated ACLs, or anything that talks to Gitolite should also pass the integration tests. They need root and the `gitolite3` package, so run them on a disposable machine or container:
+
+```bash
+sudo make test-integration
+```
+
+GitHub Actions runs them in a separate `integration` job.
+
 ## Design constraints
 
 Keep the project small and conservative:

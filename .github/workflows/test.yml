@@ -25,3 +25,22 @@ jobs:
 
       - name: Run checks
         run: make check
+
+  integration:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Gitolite
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gitolite3 openssh-client git
+
+      - name: Show tool versions
+        run: |
+          git --version
+          dpkg-query -W -f='gitolite3 ${Version}\n' gitolite3
+
+      - name: Run Gitolite integration tests
+        run: sudo make test-integration

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Stand-in for ssh, used by tests/integration.sh so the tests need no sshd.
+#
+# Git calls it as (with GIT_SSH_VARIANT=simple):
+#   fake-ssh as-KEYNAME COMMAND...
+#
+# It does what sshd does for a Gitolite key: find the public key
+# $MGS_IT_KEYS/KEYNAME.pub in the hosting account's authorized_keys, then
+# run that line's forced command as the hosting account, with a clean
+# environment and SSH_ORIGINAL_COMMAND set to the requested command.
+# A key that is not in authorized_keys is rejected, like sshd would.
+set -Eeuo pipefail
+
+host=${1:?usage: fake-ssh as-KEYNAME COMMAND...}
+shift
+key_name=${host#as-}
+: "${MGS_IT_GIT_USER:?}" "${MGS_IT_GIT_HOME:?}" "${MGS_IT_KEYS:?}"
+
+blob=$(awk 'NF && $1 !~ /^#/ {print $2; exit}' "$MGS_IT_KEYS/$key_name.pub")
+line=$(grep -F " $blob" "$MGS_IT_GIT_HOME/.ssh/authorized_keys" || true)
+if [[ -z $line ]]; then
+  printf 'fake-ssh: Permission denied (publickey) for key %s\n' "$key_name" >&2
+  exit 255
+fi
+
+forced=$(sed -n 's/^command="\([^"]*\)".*/\1/p' <<<"$line")
+if [[ -z $forced ]]; then
+  printf 'fake-ssh: key %s has no forced command\n' "$key_name" >&2
+  exit 255
+fi
+
+cd "$MGS_IT_GIT_HOME"
+exec runuser -u "$MGS_IT_GIT_USER" -- env -i \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  HOME="$MGS_IT_GIT_HOME" \
+  USER="$MGS_IT_GIT_USER" \
+  LOGNAME="$MGS_IT_GIT_USER" \
+  SSH_ORIGINAL_COMMAND="$*" \
+  SSH_CONNECTION="127.0.0.1 50000 127.0.0.1 22" \
+  /bin/sh -c "$forced"
