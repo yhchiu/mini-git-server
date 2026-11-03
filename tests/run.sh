@@ -744,6 +744,52 @@ test_sync_rebases_unpushed_commits() {
   assert_contains "$out" 'up to date'
 }
 
+test_host_keys_prints_fingerprints_and_known_hosts_lines() {
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    printf '  skipped: ssh-keygen is not installed\n' >&2
+    return 0
+  fi
+  local tmp keydir out blob
+  tmp=$(new_tmp)
+  keydir="$tmp/etc-ssh"
+  mkdir -p "$keydir"
+  ssh-keygen -q -t ed25519 -N '' -C host -f "$keydir/ssh_host_ed25519_key"
+  blob=$(awk '{print $2}' "$keydir/ssh_host_ed25519_key.pub")
+
+  out=$(
+    # shellcheck source=/dev/null
+    source "$SCRIPT"
+    # shellcheck disable=SC2034 # read by server_host_keys from the script
+    SSH_HOST_KEY_DIR=$keydir
+    server_host_keys --host git.example.internal --port 2222
+  )
+  assert_contains "$out" "$(ssh-keygen -lf "$keydir/ssh_host_ed25519_key.pub")"
+  assert_contains "$out" "[git.example.internal]:2222 ssh-ed25519 $blob"
+
+  out=$(
+    # shellcheck source=/dev/null
+    source "$SCRIPT"
+    # shellcheck disable=SC2034 # read by server_host_keys from the script
+    SSH_HOST_KEY_DIR=$keydir
+    server_host_keys --host git.example.internal --port 22
+  )
+  assert_contains "$out" "git.example.internal ssh-ed25519 $blob"
+  assert_not_contains "$out" '[git.example.internal]'
+}
+
+test_ssh_hardening_dropin_accepts_git_protocol_for_git_user_only() {
+  local out
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  out=$(ssh_hardening_dropin git)
+  # AcceptEnv must be inside "Match User git", before "Match all".
+  printf '%s\n' "$out" | awk '
+    /^Match User git$/ { in_git = 1; next }
+    /^Match all$/ { in_git = 0 }
+    in_git && $1 == "AcceptEnv" && $2 == "GIT_PROTOCOL" { found = 1 }
+    END { exit !found }'
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -777,6 +823,8 @@ run_test 'repo-set rejects agent names with special characters' test_repo_set_re
 run_test 'repo-set warns about identities without keys' test_repo_set_warns_about_identities_without_keys
 run_test 'apply stops when origin is newer, and sync keeps staged changes' test_apply_stops_when_behind_and_sync_keeps_staged_changes
 run_test 'sync rebases local commits that were not pushed' test_sync_rebases_unpushed_commits
+run_test 'host-keys prints fingerprints and known_hosts lines' test_host_keys_prints_fingerprints_and_known_hosts_lines
+run_test 'SSH hardening accepts GIT_PROTOCOL for the hosting user only' test_ssh_hardening_dropin_accepts_git_protocol_for_git_user_only
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

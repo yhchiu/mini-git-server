@@ -35,7 +35,7 @@ jobs:
       - name: Install Gitolite
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gitolite3 openssh-client git
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gitolite3 openssh-client openssh-server git
 
       - name: Show tool versions
         run: |

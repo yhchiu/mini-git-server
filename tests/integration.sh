@@ -303,6 +303,35 @@ test_two_admin_machines_with_sync() {
   [[ -d "$GL_HOME/repositories/from-desktop.git" && -d "$GL_HOME/repositories/from-laptop.git" ]]
 }
 
+test_sshd_accepts_hardening_dropin() {
+  if ! command -v sshd >/dev/null 2>&1; then
+    printf '  skipped: sshd is not installed\n'
+    return 0
+  fi
+  # Check the generated drop-in with the real sshd, without touching the
+  # system SSH configuration.
+  local dir="$TMP/sshd" out
+  mkdir -p "$dir"
+  ssh-keygen -q -t ed25519 -N '' -f "$dir/host_key"
+  (
+    # shellcheck source=/dev/null
+    source "$SCRIPT"
+    ssh_hardening_dropin "$GL_USER"
+  ) >"$dir/90-gitolite.conf"
+  printf 'Port 2222\nHostKey %s\nAcceptEnv LANG LC_*\nInclude %s\n' \
+    "$dir/host_key" "$dir/90-gitolite.conf" >"$dir/sshd_config"
+
+  sshd -t -f "$dir/sshd_config"
+  out=$(sshd -T -f "$dir/sshd_config" -C "user=$GL_USER,host=localhost,addr=127.0.0.1")
+  printf '%s\n' "$out" | grep -qx 'acceptenv GIT_PROTOCOL'
+  printf '%s\n' "$out" | grep -qx 'permittty no'
+  out=$(sshd -T -f "$dir/sshd_config" -C "user=root,host=localhost,addr=127.0.0.1")
+  if printf '%s\n' "$out" | grep -qx 'acceptenv GIT_PROTOCOL'; then
+    printf '  GIT_PROTOCOL must only be accepted for the hosting user\n'
+    return 1
+  fi
+}
+
 test_fsck_checks_every_repository() {
   "$SCRIPT" fsck --git-user "$GL_USER"
 }
@@ -361,6 +390,7 @@ step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_a
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
 step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync
+step 'sshd accepts the generated hardening drop-in' test_sshd_accepts_hardening_dropin
 step 'fsck checks every repository' test_fsck_checks_every_repository
 step 'backup mirrors every repository as root' test_backup_mirrors_every_repository
 step 'doctor detects a wrong admin branch and repo-set-default repairs it' test_doctor_detects_and_repo_set_default_repairs_admin_branch

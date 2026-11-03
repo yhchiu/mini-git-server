@@ -12,6 +12,7 @@ DEFAULT_SSHD_PORT_DROPIN="/etc/ssh/sshd_config.d/00-gitolite-port.conf"
 # of gitolite-admin. Newer upstream releases follow the admin repository HEAD,
 # which also works as long as HEAD points here.
 GITOLITE_ADMIN_BRANCH="master"
+SSH_HOST_KEY_DIR="/etc/ssh"
 
 log()  { printf '[INFO] %s\n' "$*" >&2; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -31,6 +32,7 @@ Server commands (run on the Git server):
   backup          Create a Git-aware mirror backup of all repositories
   fsck            Run git fsck on hosted repositories
   repo-set-default Set a repository HEAD/default branch
+  host-keys       Print SSH host key fingerprints and known_hosts lines
 
 Admin-workstation commands (run inside or against a gitolite-admin clone):
   admin-clone     Clone gitolite-admin from the server
@@ -348,6 +350,30 @@ init_hosting_account() {
   fi
 }
 
+# Print the sshd drop-in that restricts the hosting account.
+ssh_hardening_dropin() {
+  local git_user=$1
+  cat <<EOF_HARDEN
+# Managed by mini-git-server.sh
+# Gitolite itself installs per-key forced commands in authorized_keys.
+# Do not add ForceCommand here.
+Match User $git_user
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+    PermitTTY no
+    # Let Git clients use protocol v2, which is faster for repositories
+    # with many branches (for example many agent branches).
+    AcceptEnv GIT_PROTOCOL
+
+Match all
+EOF_HARDEN
+}
+
 server_install() {
   require_root
   local admin_key="" admin_name="admin" git_user=$DEFAULT_GIT_USER ssh_port=$DEFAULT_SSH_PORT
@@ -437,22 +463,7 @@ EOF_PORT
     install -d -m 0755 /etc/ssh/sshd_config.d
     local tmp_dropin
     tmp_dropin=$(mktemp)
-    cat >"$tmp_dropin" <<EOF_HARDEN
-# Managed by mini-git-server.sh
-# Gitolite itself installs per-key forced commands in authorized_keys.
-# Do not add ForceCommand here.
-Match User $git_user
-    PubkeyAuthentication yes
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
-    X11Forwarding no
-    AllowTcpForwarding no
-    AllowAgentForwarding no
-    PermitTunnel no
-    PermitTTY no
-
-Match all
-EOF_HARDEN
+    ssh_hardening_dropin "$git_user" >"$tmp_dropin"
     install -m 0644 "$tmp_dropin" "$DEFAULT_SSHD_DROPIN"
     rm -f "$tmp_dropin"
 
@@ -480,7 +491,66 @@ From the admin workstation (using the private key matching $admin_key):
 
 Recommended next step:
   mini-git-server.sh admin-init --admin-dir ./gitolite-admin
+
 EOF_RESULT
+  server_host_keys --port "$ssh_port"
+}
+
+server_host_keys_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh host-keys [--host NAME] [--port PORT]
+
+Print this server's SSH host key fingerprints and known_hosts lines.
+
+Options:
+  --host NAME   Host name that clients use (default: this host's FQDN)
+  --port PORT   SSH port that clients use (default: the port sshd uses)
+  -h, --help
+
+Copy the known_hosts lines to admin workstations and agent hosts over a
+channel you trust, and use 'StrictHostKeyChecking yes' there. Then no
+machine has to accept an unknown host key, and an agent that runs without
+a terminal does not get stuck at the host key prompt.
+USAGE
+}
+
+server_host_keys() {
+  local host="" port=""
+  while (($#)); do
+    case "$1" in
+      --host) [[ $# -ge 2 ]] || die "--host requires a value"; host=$2; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || die "--port requires a value"; port=$2; shift 2 ;;
+      -h|--help) server_host_keys_usage; return 0 ;;
+      *) die "Unknown host-keys option: $1" ;;
+    esac
+  done
+  need_cmd ssh-keygen
+  [[ -n $host ]] || host=$(hostname -f 2>/dev/null || hostname)
+  [[ -n $host && $host != *[[:space:]]* ]] || die "Invalid host name: $host"
+  if [[ -z $port ]]; then
+    port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}' || true)
+    if [[ -z $port ]]; then
+      port=$DEFAULT_SSH_PORT
+      warn "Could not read the SSH port from sshd (run as root, or pass --port). Using $port."
+    fi
+  fi
+  validate_port "$port"
+
+  local key_file known_host=$host
+  local -a key_files=()
+  mapfile -t key_files < <(find "$SSH_HOST_KEY_DIR" -maxdepth 1 -type f -name 'ssh_host_*_key.pub' | sort)
+  (( ${#key_files[@]} > 0 )) || die "No SSH host keys found in $SSH_HOST_KEY_DIR"
+  [[ $port == 22 ]] || known_host="[$host]:$port"
+
+  printf 'SSH host key fingerprints for %s:\n' "$host"
+  for key_file in "${key_files[@]}"; do
+    printf '  %s\n' "$(ssh-keygen -lf "$key_file")"
+  done
+  printf '\nknown_hosts lines (replace %s with the name clients use, if different):\n' "$host"
+  for key_file in "${key_files[@]}"; do
+    awk -v h="$known_host" 'NF && $1 !~ /^#/ {print h, $1, $2; exit}' "$key_file"
+  done
 }
 
 server_status_usage() {
@@ -640,6 +710,16 @@ server_doctor() {
     check_ok "SSH hardening drop-in is installed"
   else
     check_warn "SSH hardening drop-in is not installed"
+  fi
+
+  # Ask sshd for the effective settings of a connection as the hosting user.
+  if command -v sshd >/dev/null 2>&1; then
+    if sshd -T -C "user=$git_user,host=localhost,addr=127.0.0.1" 2>/dev/null \
+      | awk '$1 == "acceptenv" && $2 == "GIT_PROTOCOL" {found = 1} END {exit !found}'; then
+      check_ok "sshd accepts GIT_PROTOCOL for $git_user (Git protocol v2)"
+    else
+      check_warn "sshd does not accept GIT_PROTOCOL for $git_user, so Git uses the slower protocol v0 (see README: Git protocol v2)"
+    fi
   fi
 
   # sshkeys-lint reads ~/.ssh/authorized_keys only when stdin is a terminal.
@@ -1621,6 +1701,7 @@ main() {
     backup)       server_backup "$@" ;;
     fsck)         server_fsck "$@" ;;
     repo-set-default) server_repo_set_default "$@" ;;
+    host-keys)    server_host_keys "$@" ;;
     admin-clone)  admin_clone "$@" ;;
     admin-init)   admin_init "$@" ;;
     user-add)     user_add "$@" ;;

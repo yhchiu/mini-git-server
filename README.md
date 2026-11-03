@@ -32,6 +32,7 @@ doctor
 backup
 fsck
 repo-set-default
+host-keys
 ```
 
 Admin-workstation commands:
@@ -100,8 +101,10 @@ The installer:
 4. optionally sets `init.defaultBranch` for the hosting account;
 5. initializes Gitolite with the supplied admin key;
 6. writes an sshd port drop-in at `/etc/ssh/sshd_config.d/00-gitolite-port.conf`;
-7. adds an SSH `Match User git` hardening drop-in;
-8. validates the SSH configuration before reloading SSH.
+7. adds an SSH `Match User git` hardening drop-in, which also accepts the
+   `GIT_PROTOCOL` variable so Git can use protocol v2;
+8. validates the SSH configuration before reloading SSH;
+9. prints the SSH host key fingerprints and `known_hosts` lines.
 
 `--ssh-port` now **configures sshd**, rather than being informational only.
 
@@ -136,6 +139,11 @@ Host internal-git
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
 ```
+
+Before the first connection, add the `known_hosts` lines that `install`
+printed (or run `sudo ./mini-git-server.sh host-keys --host
+git.example.internal` on the server) to `~/.ssh/known_hosts`. Then SSH does
+not have to ask whether to trust an unknown host key.
 
 Verify access:
 
@@ -632,7 +640,41 @@ Host internal-git
     IdentityFile ~/.ssh/agent-impl
     IdentitiesOnly yes
     IdentityAgent none
+    StrictHostKeyChecking yes
+    UserKnownHostsFile ~/.ssh/known_hosts
 ```
+
+Put the `known_hosts` lines from `host-keys` into that file when you set up
+the agent environment. With `StrictHostKeyChecking yes` the agent refuses an
+unknown or changed host key, instead of waiting at a prompt or being told to
+turn the check off.
+
+### Server host keys
+
+```bash
+sudo ./mini-git-server.sh host-keys --host git.example.internal
+```
+
+This prints the fingerprint of every SSH host key and a `known_hosts` line
+for each. The port is read from sshd; pass `--port` to override it. Copy the
+lines to admin workstations and agent hosts over a channel you trust.
+
+### Many agents at once
+
+- **Git protocol v2.** New installs accept `GIT_PROTOCOL` for the hosting
+  account, so Git can use protocol v2. With v2 the server lists only the
+  refs a client asks for (for example only `trunk` in `git fetch origin
+  trunk`), instead of every branch and tag on every connection. This
+  matters when a repository collects many agent branches. On an
+  older install, add `AcceptEnv GIT_PROTOCOL` inside the `Match User git`
+  block of `/etc/ssh/sshd_config.d/90-gitolite.conf`, then run
+  `sudo sshd -t && sudo systemctl reload ssh`. `doctor` reports whether it is
+  enabled.
+- **Connection bursts.** By default sshd starts dropping new connections
+  at random once 10 of them are waiting to log in (`MaxStartups 10:30:100`).
+  If many agents fetch at the same moment and some fail with "Connection
+  closed", raise it, for example `MaxStartups 50:30:200`, in a drop-in
+  outside any `Match` block.
 
 An agent can check which identity it really has:
 
