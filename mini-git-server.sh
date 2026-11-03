@@ -234,9 +234,11 @@ init_hosting_account() {
 
   # Set the default branch only after setup, so it affects repositories
   # created later (through gitolite-admin) but never gitolite-admin itself.
+  # Use -C so Git does not try to read the caller's current directory, which
+  # the hosting account may not be allowed to read (for example /root).
   if [[ -n $default_branch ]]; then
     log "Setting Git default branch for new repositories to '$default_branch'"
-    runuser -u "$git_user" -- env HOME="$git_home" git config --global init.defaultBranch "$default_branch"
+    runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global init.defaultBranch "$default_branch"
   fi
 }
 
@@ -403,7 +405,7 @@ server_status() {
   printf '%-20s %s\n' "Gitolite:" "$(gitolite --version 2>/dev/null | head -n1 || echo missing)"
   printf '%-20s %s\n' "SSH service:" "$(systemctl is-active ssh 2>/dev/null || echo unknown)"
   printf '%-20s %s\n' "SSH ports:" "$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, - || echo unknown)"
-  printf '%-20s %s\n' "Default branch:" "$(runuser -u "$git_user" -- env HOME="$git_home" git config --global --get init.defaultBranch 2>/dev/null || echo Git-default)"
+  printf '%-20s %s\n' "Default branch:" "$(runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global --get init.defaultBranch 2>/dev/null || echo Git-default)"
   printf '%-20s %s\n' "Password status:" "$(passwd -S "$git_user" 2>/dev/null | awk '{print $2}' || echo unknown)"
 
   local repo_count=0
