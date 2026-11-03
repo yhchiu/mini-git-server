@@ -233,6 +233,20 @@ test_admin_workflow_is_applied() {
   assert_contains "$out" 'project-x'
 }
 
+test_user_remove_protects_real_admin_key() {
+  # gitolite setup wrote conf/gitolite.conf and keydir/arthur-admin.pub;
+  # removing that only admin key must be refused.
+  local out
+  if out=$(client "$SCRIPT" user-remove --admin-dir "$ADMIN" --name arthur-admin 2>&1); then
+    printf '  user-remove removed the only admin key\n'
+    return 1
+  fi
+  printf '%s\n' "$out"
+  assert_contains "$out" 'last key that can push to gitolite-admin'
+  [[ -f "$ADMIN/keydir/arthur-admin.pub" ]]
+  git -C "$ADMIN" diff --cached --quiet
+}
+
 test_gitolite_enforces_agent_acl() {
   git init --quiet -b trunk "$WORK"
   git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
@@ -324,6 +338,7 @@ step 'install keeps gitolite-admin on master with --default-branch' test_init_ke
 step 'status and doctor work from a directory the hosting account cannot read' test_server_commands_from_unreadable_directory
 step 'doctor lints authorized_keys when stdin is not a terminal' test_doctor_lints_authorized_keys_without_terminal
 step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_applied
+step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
 step 'fsck checks every repository' test_fsck_checks_every_repository
 step 'backup mirrors every repository as root' test_backup_mirrors_every_repository

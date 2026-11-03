@@ -232,6 +232,36 @@ For AI agents, use separate identities and separate keys:
   --key-id agent-host-1
 ```
 
+`user-add` refuses:
+
+- a key that is already stored for another identity, because sshd would use
+  only the first match and the two identities would silently become one;
+- a name that Gitolite would read as a different user. Gitolite reads
+  `arthur@laptop.pub` as user `arthur`, so use `--key-id laptop` for device
+  labels. E-mail style names such as `a@example.com` are fine.
+
+### Remove keys
+
+```bash
+# Remove keydir/arthur.pub
+/path/to/mini-git-server.sh user-remove --name arthur
+
+# Remove one device key: keydir/notebook/arthur.pub
+/path/to/mini-git-server.sh user-remove --name arthur --key-id notebook
+
+# Remove every key of an identity, for example a retired agent
+/path/to/mini-git-server.sh user-remove --name agent-fix --all
+```
+
+`user-remove` refuses to remove the last key that can push to
+`gitolite-admin`, because nobody could change access rules afterwards. Add
+another admin key first, or pass `--force` if that is really intended.
+
+When an identity has no keys left but is still named in an access rule,
+`user-remove` lists the files. Remove the name from those rules too:
+otherwise a key added later under the same name would get the old access
+back.
+
 ## 6. Set and inspect repository ACLs
 
 `repo-set` is the primary repository-management command. It declares the
@@ -292,6 +322,16 @@ metacharacters in a valid Git branch name do not broaden the rule accidentally.
 
 If no `--protected-branch` is supplied, the script does not assume a branch
 name.
+
+`repo-set` checks the ACL before writing it:
+
+- Each identity may have only one role (owner, writer, agent or reader). For
+  example, an agent that is also listed as a writer could push to every
+  branch except the protected ones, so this is refused.
+- Agent names may only use letters, digits, `-` and `_`, because Gitolite
+  puts the name into the branch rule `agent/USER/`.
+- It warns about identities that have no key in `keydir/` yet. This usually
+  means a typing mistake, or a key that still has to be added.
 
 ### `repo-set` replaces the managed state
 

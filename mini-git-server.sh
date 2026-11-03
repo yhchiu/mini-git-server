@@ -196,6 +196,60 @@ list_has() {
   return 1
 }
 
+# Print the conf files (relative to the admin directory) whose access rules
+# or group definitions name USER. Comment lines are ignored.
+acl_references() {
+  local dir=$1 name=$2 file
+  while IFS= read -r -d '' file; do
+    if awk -v n="$name" '
+      /^[[:space:]]*#/ { next }
+      index($0, "=") {
+        sub(/#.*/, "")
+        split($0, parts, "=")
+        m = split(parts[2], users, " ")
+        for (i = 1; i <= m; i++) if (users[i] == n) found = 1
+      }
+      END { exit !found }
+    ' "$file"; then
+      printf '%s\n' "${file#"$dir/"}"
+    fi
+  done < <(find "$dir/conf" -type f -name '*.conf' -print0 | sort -z)
+}
+
+# Agent names are inserted into the refex agent/USER/, so they must not
+# contain characters with a special meaning there.
+validate_agent_names() {
+  local item
+  local -a items=()
+  IFS=' ' read -r -a items <<<"$1"
+  for item in "${items[@]}"; do
+    [[ $item =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
+      die "Agent name '$item' may only use letters, digits, '-' and '_'. Gitolite puts it into the branch rule agent/USER/, where '.' or '@' would change what the rule matches."
+  done
+}
+
+# Arguments: ROLE LIST [ROLE LIST]... Stop when one identity has two roles.
+# For example, an agent that is also a writer could push to every branch.
+check_role_overlap() {
+  local role list item conflicts=""
+  local -A role_of=()
+  local -a items=()
+  while (($#)); do
+    role=$1 list=$2
+    shift 2
+    IFS=' ' read -r -a items <<<"$list"
+    for item in "${items[@]}"; do
+      if [[ -z ${role_of[$item]:-} ]]; then
+        role_of[$item]=$role
+      elif [[ ${role_of[$item]} != "$role" ]]; then
+        conflicts+="${conflicts:+; }'$item' is both ${role_of[$item]} and $role"
+      fi
+    done
+  done
+  [[ -z $conflicts ]] || \
+    die "Each identity may have only one role in a repository: $conflicts. Give each identity one role."
+}
+
 ensure_clean_or_staged_admin_repo() {
   local dir=$1
   git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not a Git working tree: $dir"
@@ -905,6 +959,10 @@ user_add() {
   [[ -n $name && -n $key ]] || die "--name and --key are required"
   validate_simple_name "$name" "User name"
   [[ -z $key_id ]] || validate_simple_name "$key_id" "Key ID"
+  local mapped
+  mapped=$(gitolite_user_for_keyfile "$name.pub")
+  [[ $mapped == "$name" ]] || \
+    die "Gitolite would read the key file '$name.pub' as user '$mapped', not '$name'. Use --key-id to label a device instead of '@'."
   validate_pubkey "$key"
   local dir dest
   dir=$(find_admin_dir "$requested")
@@ -916,6 +974,17 @@ user_add() {
   if [[ -e $dest && $replace -ne 1 ]]; then
     die "Key already exists: ${dest#"$dir/"} (use --replace to replace it)"
   fi
+
+  # sshd uses the first matching key, so a key stored for two identities
+  # silently acts as only one of them.
+  local blob existing
+  blob=$(awk 'NF && $1 !~ /^#/ {print $2; exit}' "$key")
+  while IFS= read -r -d '' existing; do
+    [[ $existing == "$dest" ]] && continue
+    if [[ $(awk 'NF && $1 !~ /^#/ {print $2; exit}' "$existing") == "$blob" ]]; then
+      die "This key is already stored as ${existing#"$dir/"} (user '$(gitolite_user_for_keyfile "$existing")'). Each identity, and each agent, needs its own key."
+    fi
+  done < <(find "$dir/keydir" -type f -name '*.pub' -print0)
   if list_has "$(admin_identities "$dir" | tr '\n' ' ')" "$name"; then
     warn "'$name' can push to gitolite-admin and change every access rule. Keep this key off machines where AI agents run (see README: Identities and keys)."
   fi
@@ -934,18 +1003,28 @@ Usage:
 Options:
   --name USER           Logical Gitolite identity (required)
   --key-id ID           Remove only keydir/ID/USER.pub
-                        Without this, removes keydir/USER.pub only.
+  --all                 Remove every key of USER, in any keydir subdirectory
+  --force               Allow removing the last key that can push to
+                        gitolite-admin (this locks out every admin)
   --admin-dir DIR       gitolite-admin working tree (default: current dir)
   -h, --help
+
+Without --key-id or --all, removes keydir/USER.pub only.
+
+When USER has no keys left but is still named in an access rule, a warning
+lists those files: a key added later under the same name would get that
+access again.
 USAGE
 }
 
 user_remove() {
-  local name="" key_id="" requested=""
+  local name="" key_id="" requested="" all=0 force=0
   while (($#)); do
     case "$1" in
       --name) [[ $# -ge 2 ]] || die "--name requires a value"; name=$2; shift 2 ;;
       --key-id) [[ $# -ge 2 ]] || die "--key-id requires a value"; key_id=$2; shift 2 ;;
+      --all) all=1; shift ;;
+      --force) force=1; shift ;;
       --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
       -h|--help) user_remove_usage; return 0 ;;
       *) die "Unknown user-remove option: $1" ;;
@@ -954,12 +1033,65 @@ user_remove() {
   [[ -n $name ]] || die "--name is required"
   validate_simple_name "$name" "User name"
   [[ -z $key_id ]] || validate_simple_name "$key_id" "Key ID"
+  [[ -z $key_id || $all -eq 0 ]] || die "Use either --key-id or --all, not both"
   local dir target
+  local -a targets=()
   dir=$(find_admin_dir "$requested")
-  if [[ -n $key_id ]]; then target="$dir/keydir/$key_id/$name.pub"; else target="$dir/keydir/$name.pub"; fi
-  [[ -e $target ]] || die "Key not found: ${target#"$dir/"}"
-  git -C "$dir" rm -- "${target#"$dir/"}"
-  rmdir "$(dirname "$target")" 2>/dev/null || true
+  if (( all )); then
+    mapfile -t targets < <(identity_key_files "$dir" "$name")
+    (( ${#targets[@]} > 0 )) || die "No keys found for user: $name"
+  else
+    if [[ -n $key_id ]]; then target="keydir/$key_id/$name.pub"; else target="keydir/$name.pub"; fi
+    [[ -e "$dir/$target" ]] || die "Key not found: $target"
+    targets=("$target")
+  fi
+
+  # Refuse to remove the last key that can push to gitolite-admin.
+  local admins admin file remaining=0
+  admins=$(admin_identities "$dir")
+  if [[ -z $admins ]]; then
+    warn "No user with write access to gitolite-admin found in conf/gitolite.conf; skipping the lockout check."
+  else
+    while IFS= read -r admin; do
+      while IFS= read -r file; do
+        [[ -n $file ]] || continue
+        for target in "${targets[@]}"; do
+          [[ $file == "$target" ]] && continue 2
+        done
+        remaining=$((remaining + 1))
+      done < <(identity_key_files "$dir" "$admin")
+    done <<<"$admins"
+    if (( remaining == 0 )); then
+      if (( force )); then
+        warn "Removing the last key that can push to gitolite-admin (--force)."
+      else
+        die "This would remove the last key that can push to gitolite-admin, and nobody could change access rules any more. Add another admin key first, or use --force."
+      fi
+    fi
+  fi
+
+  for target in "${targets[@]}"; do
+    if git -C "$dir" ls-files --error-unmatch -- "$target" >/dev/null 2>&1; then
+      # -f also handles a key that was staged by user-add but never applied.
+      git -C "$dir" rm --quiet -f -- "$target"
+    else
+      rm -f -- "$dir/$target"
+    fi
+    # Remove an empty key-id directory, but never keydir itself.
+    if [[ $(dirname "$target") != keydir ]]; then
+      rmdir "$dir/$(dirname "$target")" 2>/dev/null || true
+    fi
+    log "Staged removal of key: $target"
+  done
+
+  local refs
+  if [[ -z $(identity_key_files "$dir" "$name") ]]; then
+    refs=$(acl_references "$dir" "$name" | paste -sd ' ' -)
+    if [[ -n $refs ]]; then
+      warn "'$name' has no keys left but is still named in: $refs"
+      warn "A key added later under the name '$name' would get that access again. Remove '$name' from those rules (for example with repo-set)."
+    fi
+  fi
 }
 
 user_list_usage() {
@@ -984,7 +1116,7 @@ user_list() {
   printf '%-24s %-36s %s\n' "USER" "KEY PATH" "FINGERPRINT"
   while IFS= read -r -d '' file; do
     rel=${file#"$dir/keydir/"}
-    user=$(basename "$file" .pub)
+    user=$(gitolite_user_for_keyfile "$file")
     fp=$(ssh-keygen -lf "$file" 2>/dev/null | awk '{print $2}' || echo invalid)
     printf '%-24s %-36s %s\n' "$user" "$rel" "$fp"
   done < <(find "$dir/keydir" -type f -name '*.pub' -print0 | sort -z)
@@ -1012,6 +1144,10 @@ This command declares the complete desired ACL state for a repository. Omitted
 writers, readers, agents, and protected branches are removed from the managed
 fragment. It writes conf/repos/<encoded-name>.conf and stages the change, but
 never pushes; run 'apply' after reviewing the staged diff.
+
+Each identity may have only one role (owner, writer, agent or reader). Agent
+names may only use letters, digits, '-' and '_'. A warning is shown for any
+identity that has no key in keydir yet.
 USAGE
 }
 
@@ -1040,6 +1176,8 @@ repo_set() {
   validate_user_list "$writers"
   validate_user_list "$readers"
   validate_user_list "$agents"
+  validate_agent_names "$agents"
+  check_role_overlap owner "$owner" writer "$writers" agent "$agents" reader "$readers"
   local branch
   for branch in "${protected_branches[@]}"; do
     validate_branch_name "$branch"
@@ -1061,6 +1199,9 @@ repo_set() {
   for identity in "${identities[@]}"; do
     if list_has "$admins" "$identity"; then
       warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
+    fi
+    if [[ -z $(identity_key_files "$dir" "$identity") ]]; then
+      warn "No key in keydir for '$identity'. Its rules have no effect until a key is added with user-add. Check the spelling."
     fi
   done
 

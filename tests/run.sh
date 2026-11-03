@@ -532,7 +532,8 @@ test_user_add_warns_for_admin_identity() {
   out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name admin --key "$key" --key-id laptop 2>&1)
   assert_contains "$out" "'admin' can push to gitolite-admin"
 
-  out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name arthur --key "$key" --key-id laptop 2>&1)
+  printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIArthurDailyKey arthur@example.invalid' >"$tmp/arthur.pub"
+  out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name arthur --key "$tmp/arthur.pub" --key-id laptop 2>&1)
   assert_not_contains "$out" 'can push to gitolite-admin'
 }
 
@@ -548,6 +549,135 @@ test_repo_set_warns_when_admin_identity_is_used() {
 
   out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur 2>&1)
   assert_not_contains "$out" 'gitolite-admin identity'
+}
+
+# Write a placeholder public key file with a unique key blob.
+write_key() {
+  local path=$1 blob=$2
+  mkdir -p "$(dirname "$path")"
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5%s test@example.invalid\n' "$blob" >"$path"
+}
+
+test_user_add_rejects_names_gitolite_would_rename() {
+  local tmp repo fakebin out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  fakebin=$(fake_ssh_keygen "$tmp")
+  new_admin_repo "$repo"
+  write_key "$tmp/k1.pub" KeyOne
+  write_key "$tmp/k2.pub" KeyTwo
+
+  if out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name arthur@laptop --key "$tmp/k1.pub" 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "as user 'arthur', not 'arthur@laptop'"
+
+  # An e-mail style name is kept by Gitolite, so it is accepted.
+  PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name a@example.com --key "$tmp/k2.pub" >/dev/null 2>&1
+  [[ -f "$repo/keydir/a@example.com.pub" ]]
+}
+
+test_user_add_rejects_key_used_by_another_identity() {
+  local tmp repo fakebin out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  fakebin=$(fake_ssh_keygen "$tmp")
+  new_admin_repo "$repo"
+  write_key "$tmp/shared.pub" SharedKey
+
+  PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name agent-impl --key "$tmp/shared.pub" >/dev/null 2>&1
+  if out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name agent-fix --key "$tmp/shared.pub" 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "already stored as keydir/agent-impl.pub (user 'agent-impl')"
+  [[ ! -e "$repo/keydir/agent-fix.pub" ]]
+
+  # Replacing a key file with the same key is still allowed.
+  PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name agent-impl --key "$tmp/shared.pub" --replace >/dev/null 2>&1
+}
+
+test_user_remove_refuses_last_admin_key() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  write_key "$repo/keydir/admin.pub" AdminKey
+  git -C "$repo" add keydir && git -C "$repo" commit -qm 'admin key'
+
+  if out=$("$SCRIPT" user-remove --admin-dir "$repo" --name admin 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'last key that can push to gitolite-admin'
+  [[ -f "$repo/keydir/admin.pub" ]]
+  git -C "$repo" diff --cached --quiet
+
+  # With a second admin key, removing the first one is fine.
+  write_key "$repo/keydir/laptop/admin.pub" AdminLaptopKey
+  git -C "$repo" add keydir/laptop/admin.pub
+  "$SCRIPT" user-remove --admin-dir "$repo" --name admin >/dev/null 2>&1
+  [[ ! -e "$repo/keydir/admin.pub" && -f "$repo/keydir/laptop/admin.pub" ]]
+
+  # --force removes the last one, but keydir itself stays.
+  "$SCRIPT" user-remove --admin-dir "$repo" --name admin --key-id laptop --force >/dev/null 2>&1
+  [[ ! -e "$repo/keydir/laptop" && -d "$repo/keydir" ]]
+}
+
+test_user_remove_all_warns_about_remaining_acl() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  write_key "$repo/keydir/admin.pub" AdminKey
+  write_key "$repo/keydir/desktop/dev1.pub" DevDesktop
+  write_key "$repo/keydir/notebook/dev1.pub" DevNotebook
+  git -C "$repo" add keydir && git -C "$repo" commit -qm keys
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner admin2 --writers dev1 >/dev/null 2>&1
+
+  out=$("$SCRIPT" user-remove --admin-dir "$repo" --name dev1 --all 2>&1)
+  [[ ! -e "$repo/keydir/desktop" && ! -e "$repo/keydir/notebook" ]]
+  assert_contains "$out" "'dev1' has no keys left but is still named in: conf/repos/project-x.conf"
+}
+
+test_repo_set_rejects_identity_with_two_roles() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  if out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --writers dev1,agent-fix --agents agent-impl,agent-fix 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "'agent-fix' is both writer and agent"
+  [[ ! -e "$repo/conf/repos/project-x.conf" ]]
+}
+
+test_repo_set_rejects_agent_names_with_special_characters() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  if out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --agents agent.impl 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "Agent name 'agent.impl'"
+}
+
+test_repo_set_warns_about_identities_without_keys() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  write_key "$repo/keydir/arthur.pub" ArthurKey
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers ci 2>&1)
+  assert_contains "$out" "No key in keydir for 'ci'"
+  assert_not_contains "$out" "No key in keydir for 'arthur'"
 }
 
 run_test 'bash syntax' test_bash_syntax
@@ -574,6 +704,13 @@ run_test 'keydir file names map to users like Gitolite does' test_gitolite_user_
 run_test 'admin identities are read from the gitolite-admin block' test_admin_identities_reads_gitolite_admin_block
 run_test 'user-add warns when adding a key to an admin identity' test_user_add_warns_for_admin_identity
 run_test 'repo-set warns when an admin identity is used in an ACL' test_repo_set_warns_when_admin_identity_is_used
+run_test 'user-add rejects names that Gitolite would map to another user' test_user_add_rejects_names_gitolite_would_rename
+run_test 'user-add rejects a key already used by another identity' test_user_add_rejects_key_used_by_another_identity
+run_test 'user-remove refuses to remove the last admin key' test_user_remove_refuses_last_admin_key
+run_test 'user-remove --all removes every key and warns about remaining ACL entries' test_user_remove_all_warns_about_remaining_acl
+run_test 'repo-set rejects an identity with two roles' test_repo_set_rejects_identity_with_two_roles
+run_test 'repo-set rejects agent names with special characters' test_repo_set_rejects_agent_names_with_special_characters
+run_test 'repo-set warns about identities without keys' test_repo_set_warns_about_identities_without_keys
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
