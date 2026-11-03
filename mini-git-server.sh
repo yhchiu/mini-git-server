@@ -536,7 +536,12 @@ server_doctor() {
     check_warn "SSH hardening drop-in is not installed"
   fi
 
-  if runuser -u "$git_user" -- env HOME="$git_home" gitolite sshkeys-lint >/dev/null 2>&1; then
+  # sshkeys-lint reads ~/.ssh/authorized_keys only when stdin is a terminal.
+  # Otherwise it reads the keys from stdin, so under cron or CI it either
+  # waits forever or checks nothing. Pass the file on stdin explicitly.
+  if [[ -f "$git_home/.ssh/authorized_keys" ]] && \
+    runuser -u "$git_user" -- env HOME="$git_home" gitolite sshkeys-lint \
+      <"$git_home/.ssh/authorized_keys" >/dev/null 2>&1; then
     check_ok "gitolite sshkeys-lint passed"
   else
     check_warn "gitolite sshkeys-lint returned a non-zero status; run it manually for details"
