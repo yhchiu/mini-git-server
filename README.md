@@ -527,6 +527,12 @@ Default destination:
 
 The script uses `git clone --mirror file://...` for each repository and runs `git fsck` on the backup. It also saves relevant Gitolite and sshd configuration metadata, including the managed SSH-port drop-in.
 
+The repositories are owned by the hosting account, and Git refuses to open a
+repository owned by another user ("detected dubious ownership"). The backup
+therefore reads each repository through `git upload-pack` running as the
+hosting account. Root only writes and checks the new mirror, which is owned
+by root.
+
 Keep a versioned/offline or otherwise independent copy on another system for disaster recovery.
 
 ## 12. Important operational rules

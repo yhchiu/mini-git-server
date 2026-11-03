@@ -555,7 +555,9 @@ Options:
   -h, --help
 
 The backup uses 'git clone --mirror' via file:// for each repository, avoiding
-filesystem-level copies of repositories while pushes may be occurring.
+filesystem-level copies of repositories while pushes may be occurring. The
+source repositories are read by 'git upload-pack' running as the hosting
+account; the backup itself is written and checked by root.
 USAGE
 }
 
@@ -571,11 +573,20 @@ server_backup() {
     esac
   done
 
+  validate_unix_user "$git_user"
   id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
-  local git_home repos_root stamp backup_dir
+  need_cmd runuser
+  local git_home repos_root stamp backup_dir upload_pack
   git_home=$(getent passwd "$git_user" | cut -d: -f6)
   repos_root="$git_home/repositories"
   [[ -d $repos_root ]] || die "Repository directory not found: $repos_root"
+
+  # Read each repository through git upload-pack running as the hosting
+  # account. Git refuses to open a repository owned by another user
+  # ("detected dubious ownership"), so a plain clone as root fails. This
+  # also means root never runs Git inside a repository it does not own;
+  # root only writes and checks its own new mirror.
+  printf -v upload_pack 'runuser -u %q -- env HOME=%q git upload-pack' "$git_user" "$git_home"
 
   stamp=$(date '+%Y%m%d-%H%M%S')
   backup_dir="$output/$stamp"
@@ -588,7 +599,8 @@ server_backup() {
     dest="$backup_dir/repos/$rel"
     mkdir -p "$(dirname "$dest")"
     log "Backing up $rel"
-    if git clone --quiet --mirror "file://$repo" "$dest" && git -C "$dest" fsck --full --no-dangling >/dev/null; then
+    if git clone --quiet --mirror --upload-pack="$upload_pack" "file://$repo" "$dest" \
+      && git -C "$dest" fsck --full --no-dangling >/dev/null; then
       count=$((count+1))
     else
       warn "Backup failed for $rel"
