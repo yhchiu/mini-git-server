@@ -344,6 +344,10 @@ init_hosting_account() {
   [[ $admin_head == "refs/heads/$GITOLITE_ADMIN_BRANCH" ]] || \
     die "gitolite-admin HEAD is '$admin_head', expected 'refs/heads/$GITOLITE_ADMIN_BRANCH'. Gitolite would ignore admin pushes."
 
+  # Keep a reflog in every hosted repository, so commits that were
+  # force-pushed away stay listed (and safe from gc) for a while.
+  runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global core.logAllRefUpdates always
+
   # Set the default branch only after setup, so it affects repositories
   # created later (through gitolite-admin) but never gitolite-admin itself.
   # Use -C so Git does not try to read the caller's current directory, which
@@ -703,6 +707,14 @@ server_doctor() {
     L|LK) check_ok "hosting account password is locked" ;;
     *) check_warn "hosting account password state is '$pass_state' (expected locked)" ;;
   esac
+
+  local log_refs
+  log_refs=$(runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global --get core.logAllRefUpdates 2>/dev/null || true)
+  if [[ $log_refs == always ]]; then
+    check_ok "hosted repositories keep reflogs (core.logAllRefUpdates=always)"
+  else
+    check_warn "hosted repositories keep no reflog, so force-pushed commits are harder to recover; enable it with: sudo runuser -u $git_user -- git -C $git_home config --global core.logAllRefUpdates always"
+  fi
 
   if [[ -f $DEFAULT_SSHD_PORT_DROPIN ]]; then
     check_ok "managed SSH port drop-in is installed"
@@ -1477,6 +1489,8 @@ Options:
   --agents LIST          Comma/space-separated agents. Each gets:
                            RW  agent/USER/*
                            R   everywhere else
+  --agent-rewind         Let agents force-push and delete, but only their
+                         own agent/USER/* branches (RW+ instead of RW)
   --protected-branch B   Exact branch protected from --writers/--agents.
                          Repeat this option for multiple protected branches.
   --admin-dir DIR        gitolite-admin working tree (default: current dir)
@@ -1497,7 +1511,7 @@ USAGE
 }
 
 repo_set() {
-  local repo="" owner="" writers="" readers="" agents="" requested=""
+  local repo="" owner="" writers="" readers="" agents="" requested="" agent_rewind=0
   local -a protected_branches=()
   while (($#)); do
     case "$1" in
@@ -1506,6 +1520,7 @@ repo_set() {
       --writers) [[ $# -ge 2 ]] || die "--writers requires a value"; writers=$2; shift 2 ;;
       --readers) [[ $# -ge 2 ]] || die "--readers requires a value"; readers=$2; shift 2 ;;
       --agents) [[ $# -ge 2 ]] || die "--agents requires a value"; agents=$2; shift 2 ;;
+      --agent-rewind) agent_rewind=1; shift ;;
       --protected-branch) [[ $# -ge 2 ]] || die "--protected-branch requires a value"; protected_branches+=("$2"); shift 2 ;;
       --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
       -h|--help) repo_set_usage; return 0 ;;
@@ -1521,6 +1536,7 @@ repo_set() {
   validate_acl_list "$writers"
   validate_acl_list "$readers"
   validate_acl_list "$agents"
+  [[ $agent_rewind -eq 0 || -n $agents ]] || die "--agent-rewind needs --agents"
   local branch
   for branch in "${protected_branches[@]}"; do
     validate_branch_name "$branch"
@@ -1553,6 +1569,7 @@ repo_set() {
     printf '# mini-git-server: writers=%s\n' "$writers"
     printf '# mini-git-server: agents=%s\n' "$agents"
     printf '# mini-git-server: readers=%s\n' "$readers"
+    (( agent_rewind )) && printf '# mini-git-server: agent-rewind=yes\n'
     for branch in "${protected_branches[@]}"; do
       printf '# mini-git-server: protected-branch=%s\n' "$branch"
     done
@@ -1568,7 +1585,11 @@ repo_set() {
     fi
     [[ -n $writers ]] && printf '    RW                          =   %s\n' "$writers"
     if [[ -n $agents ]]; then
-      printf '    RW      agent/USER/         =   %s\n' "$agents"
+      if (( agent_rewind )); then
+        printf '    RW+     agent/USER/         =   %s\n' "$agents"
+      else
+        printf '    RW      agent/USER/         =   %s\n' "$agents"
+      fi
       local reader_sep=""
       [[ -n $agents && -n $readers ]] && reader_sep=" "
       printf '    R                           =   %s%s%s\n' "$agents" "$reader_sep" "$readers"
@@ -1670,7 +1691,7 @@ repo_show() {
     return 0
   fi
 
-  local owner="" writers="" agents="" readers="" line value refex branch
+  local owner="" writers="" agents="" readers="" line value refex branch agent_rewind=no
   local -a protected_branches=()
 
   # Prefer explicit metadata written by repo-set. Fall back to parsing the
@@ -1682,6 +1703,7 @@ repo_show() {
         '# mini-git-server: writers='*) writers=${line#*=} ;;
         '# mini-git-server: agents='*) agents=${line#*=} ;;
         '# mini-git-server: readers='*) readers=${line#*=} ;;
+        '# mini-git-server: agent-rewind='*) agent_rewind=${line#*=} ;;
         '# mini-git-server: protected-branch='*) protected_branches+=("${line#*=}") ;;
       esac
     done <"$fragment"
@@ -1730,6 +1752,7 @@ repo_show() {
   printf 'Writers: %s\n' "${writers:-(none)}"
   printf 'Agents: %s\n' "${agents:-(none)}"
   printf 'Readers: %s\n' "${readers:-(none)}"
+  printf 'Agent rewind: %s\n' "$agent_rewind"
   printf 'Protected branches:'
   if (( ${#protected_branches[@]} == 0 )); then
     printf ' (none)\n'
@@ -1760,6 +1783,7 @@ repo_show() {
     printf ' '
     shell_quote "${reapply_cmd[i+1]}"
   done
+  [[ $agent_rewind == yes ]] && printf ' \\\n  --agent-rewind'
   printf '\n'
 }
 

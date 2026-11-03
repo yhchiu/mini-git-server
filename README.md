@@ -638,6 +638,66 @@ CI runner
 
 The restriction is enforced by Gitolite on the server, rather than relying only on agent instructions.
 
+### Letting agents rewrite their own branches
+
+By default agents cannot force-push or delete, not even their own branches.
+After a review, an agent that wants to rebase must push a new branch, for
+example `agent/agent-impl/issue-42-v2`, and old branches stay until the owner
+deletes them.
+
+Many agent tools rebase and push with `--force-with-lease`. To allow that
+inside each agent's own namespace only, add `--agent-rewind`:
+
+```bash
+/path/to/mini-git-server.sh repo-set \
+  --repo project-x \
+  --owner arthur \
+  --agents @agents \
+  --agent-rewind \
+  --protected-branch trunk
+```
+
+This changes the agent rule from `RW` to `RW+` for `agent/USER/` only.
+Agents still cannot write anywhere else, and cannot rewrite or delete
+another agent's branches.
+
+### Recovering a rewritten or deleted branch
+
+The Gitolite log records every push with the user, the branch, the old
+commit and the new commit. Find the commit you want back:
+
+```bash
+sudo grep -h 'refs/heads/agent/agent-impl/issue-42' /home/git/.gitolite/logs/gitolite-*.log
+```
+
+New installs also keep a reflog in every hosted repository
+(`core.logAllRefUpdates=always`). For a branch that was force-pushed (not
+deleted), the reflog lists its earlier commits:
+
+```bash
+sudo runuser -u git -- git -C /home/git/repositories/project-x.git \
+  reflog show refs/heads/agent/agent-impl/issue-42
+```
+
+Then create a new branch at the old commit. This is the one case where you
+run Git directly inside a hosted repository:
+
+```bash
+sudo runuser -u git -- git -C /home/git/repositories/project-x.git \
+  branch recovered/issue-42 OLD_COMMIT
+```
+
+Limits:
+
+- Deleting a branch also deletes its reflog. For deleted branches, take the
+  commit from the Gitolite log.
+- Git may delete commits that no branch or reflog points to once they are
+  two weeks old (`gc.pruneExpire`). Commits in a reflog are kept longer
+  (30 days by default). Recover soon, or rely on `backup`.
+- On an older install, enable the reflog with
+  `sudo runuser -u git -- git -C /home/git config --global core.logAllRefUpdates always`.
+  `doctor` reports whether it is enabled.
+
 ## Identities and keys
 
 Gitolite decides who you are only from the SSH key that connects. Any process

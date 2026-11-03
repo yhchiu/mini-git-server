@@ -187,6 +187,7 @@ test_server_commands_from_unreadable_directory() {
   printf '%s\n' "$out"
   assert_contains "$out" "[ OK ] gitolite-admin uses the 'master' branch"
   assert_contains "$out" '[ OK ] gitolite sshkeys-lint passed'
+  assert_contains "$out" '[ OK ] hosted repositories keep reflogs'
 }
 
 test_doctor_lints_authorized_keys_without_terminal() {
@@ -316,6 +317,45 @@ test_groups_apply_to_every_repository_using_them() {
   expect_push deny  agent-new  'HEAD:refs/heads/agent/agent-impl/g9' project-g
 }
 
+test_agent_rewind_is_limited_to_own_branches_and_recoverable() {
+  client "$SCRIPT" repo-set --admin-dir "$ADMIN" \
+    --repo project-r \
+    --owner arthur \
+    --agents agent-impl,agent-fix \
+    --agent-rewind \
+    --protected-branch trunk
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Add project-r with agent rewind'
+
+  local repo="$GL_HOME/repositories/project-r.git" first second
+  expect_push allow arthur 'HEAD:refs/heads/trunk' project-r
+  git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
+    commit --quiet --allow-empty -m 'rewind test'
+  first=$(git -C "$WORK" rev-parse HEAD)
+  expect_push allow agent-impl 'HEAD:refs/heads/agent/agent-impl/r1' project-r
+  expect_push allow agent-fix  'HEAD:refs/heads/agent/agent-fix/r1' project-r
+
+  git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
+    commit --quiet --amend --allow-empty -m 'rewind test, rewritten'
+  second=$(git -C "$WORK" rev-parse HEAD)
+  # Rewinds are allowed in the agent's own namespace only.
+  expect_push allow agent-impl '+HEAD:refs/heads/agent/agent-impl/r1' project-r
+  expect_push deny  agent-impl '+HEAD:refs/heads/agent/agent-fix/r1' project-r
+  expect_push deny  agent-impl '+HEAD:refs/heads/trunk' project-r
+
+  # The overwritten commit is still in the server reflog and the Gitolite log.
+  as_git git -C "$repo" reflog show --format=%H refs/heads/agent/agent-impl/r1 | grep -qx "$first"
+  assert_eq "$second" "$(as_git git -C "$repo" rev-parse refs/heads/agent/agent-impl/r1)"
+  grep -h 'refs/heads/agent/agent-impl/r1' "$GL_HOME"/.gitolite/logs/*.log | grep -q "$first"
+
+  # Deleting is allowed in the own namespace only, too.
+  expect_push deny  agent-impl ':refs/heads/agent/agent-fix/r1' project-r
+  expect_push allow agent-impl ':refs/heads/agent/agent-impl/r1' project-r
+  if as_git git -C "$repo" show-ref --verify --quiet refs/heads/agent/agent-impl/r1; then
+    printf '  agent/agent-impl/r1 still exists after the delete\n'
+    return 1
+  fi
+}
+
 test_two_admin_machines_with_sync() {
   local laptop="$TMP/gitolite-admin-laptop" out
   client git clone --quiet as-admin:gitolite-admin "$laptop"
@@ -423,6 +463,7 @@ step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_a
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
 step 'groups apply to every repository that uses them' test_groups_apply_to_every_repository_using_them
+step '--agent-rewind allows rewinds only in the own namespace, and they are recoverable' test_agent_rewind_is_limited_to_own_branches_and_recoverable
 step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync
 step 'sshd accepts the generated hardening drop-in' test_sshd_accepts_hardening_dropin
 step 'fsck checks every repository' test_fsck_checks_every_repository

@@ -892,6 +892,36 @@ test_repo_set_warns_about_unmanaged_group() {
   assert_not_contains "$out" "Group '@all'"
 }
 
+test_repo_set_agent_rewind_and_repo_show_round_trip() {
+  local tmp repo fragment before out cmd
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --agents agent-impl --agent-rewind --protected-branch trunk >/dev/null 2>&1
+  fragment="$repo/conf/repos/project-x.conf"
+  before=$(<"$fragment")
+  assert_contains "$before" 'RW+     agent/USER/         =   agent-impl'
+  assert_contains "$before" '# mini-git-server: agent-rewind=yes'
+  assert_contains "$before" 'refs/heads/trunk$'
+
+  out=$("$SCRIPT" repo-show --admin-dir "$repo" --repo project-x)
+  assert_contains "$out" 'Agent rewind: yes'
+  assert_contains "$out" '--agent-rewind'
+
+  # Running the printed reapply command must give the same fragment.
+  cmd=$(printf '%s\n' "$out" | sed -n '/^Reapply command:$/,$p' | tail -n +2)
+  bash -c "$cmd" >/dev/null 2>&1
+  assert_eq "$before" "$(<"$fragment")" 'reapply command must reproduce the fragment'
+
+  if out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-y --owner arthur --agent-rewind 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" '--agent-rewind needs --agents'
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -932,6 +962,7 @@ run_test 'group-set creates a group that repo-set can use' test_group_set_and_re
 run_test 'group members are checked for role overlap and agent names' test_group_members_are_checked_for_role_overlap
 run_test 'group-remove refuses a group that is still used' test_group_remove_refuses_group_in_use
 run_test 'repo-set warns about a group not managed by group-set' test_repo_set_warns_about_unmanaged_group
+run_test 'repo-set --agent-rewind round-trips through repo-show' test_repo_set_agent_rewind_and_repo_show_round_trip
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
