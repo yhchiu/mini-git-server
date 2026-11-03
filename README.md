@@ -698,6 +698,49 @@ Limits:
   `sudo runuser -u git -- git -C /home/git config --global core.logAllRefUpdates always`.
   `doctor` reports whether it is enabled.
 
+### Reviewing and merging agent work
+
+Agents never write to the main branches; the owner merges their work. In a
+clone of the project on your workstation:
+
+```bash
+# Fetch all branches, including agent/*, and drop deleted ones
+git fetch --prune origin
+
+# List agent branches, newest first
+git for-each-ref --sort=-committerdate refs/remotes/origin/agent \
+  --format='%(committerdate:short) %(refname:short) %(subject)'
+
+# See what one branch adds on top of trunk
+git log --oneline trunk..origin/agent/agent-impl/issue-42
+git diff trunk...origin/agent/agent-impl/issue-42
+
+# Compare two versions of the same work, for example after a rebase
+git range-diff trunk origin/agent/agent-impl/issue-42 origin/agent/agent-impl/issue-42-v2
+
+# Merge and publish
+git switch trunk
+git merge --no-ff origin/agent/agent-impl/issue-42
+git push origin trunk
+
+# List agent branches that are merged, then delete them on the server
+git branch -r --merged trunk --list 'origin/agent/*'
+git push origin --delete agent/agent-impl/issue-42
+```
+
+A review agent listed in `--readers` can only read. To let it hand back
+fixes or notes as a branch, list it in `--agents` instead: it then gets its
+own `agent/agent-review/*` namespace.
+
+### Instructions for the agents
+
+[`examples/AGENTS.md`](examples/AGENTS.md) is a template for the instructions
+file in each project repository (`AGENTS.md`, `CLAUDE.md`, or whatever your
+agent tool reads). It tells agents how to find their identity, which branches
+they may push to, what to do when a push is denied, and what to report when
+they hand over work. The server enforces the rules either way; the file only
+saves agents from work that would be rejected.
+
 ## Identities and keys
 
 Gitolite decides who you are only from the SSH key that connects. Any process
