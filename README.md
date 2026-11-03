@@ -51,13 +51,24 @@ apply
 
 ## 1. Generate a dedicated admin key
 
-On the administrator workstation:
+On the administrator workstation, preferably with a FIDO2 security key, so
+that every use of the admin key needs a physical touch:
+
+```bash
+ssh-keygen -t ed25519-sk -f ~/.ssh/gitolite-admin -C gitolite-admin
+```
+
+Without a security key, use a normal key with a passphrase:
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/gitolite-admin -C gitolite-admin
 ```
 
-Use a dedicated key rather than reusing an unrelated server-login key.
+Use a dedicated key rather than reusing an unrelated server-login key. The
+admin key can change every access rule, so it should belong to its own
+Gitolite identity (for example `arthur-admin`) that is used only for
+`gitolite-admin`. Day-to-day work uses a separate identity (for example
+`arthur`). See [Identities and keys](#identities-and-keys).
 
 ## 2. Install the server
 
@@ -68,7 +79,7 @@ Example using SSH port `2222` and `trunk` as the Git default branch for newly cr
 ```bash
 sudo ./mini-git-server.sh install \
   --admin-key ./gitolite-admin.pub \
-  --admin-name arthur \
+  --admin-name arthur-admin \
   --ssh-port 2222 \
   --default-branch trunk
 ```
@@ -105,27 +116,36 @@ If another active `Port` directive already exists elsewhere in the sshd configur
 
 ## 3. Configure the admin workstation
 
-For a non-default SSH port, using an SSH host alias is recommended:
+Use one SSH host alias per identity. Here `internal-git-admin` uses the
+admin key and is only used for `gitolite-admin`, and `internal-git` uses the
+daily key (added in step 5):
 
 ```sshconfig
-Host internal-git
+Host internal-git-admin
     HostName git.example.internal
     User git
     Port 2222
     IdentityFile ~/.ssh/gitolite-admin
+    IdentitiesOnly yes
+
+Host internal-git
+    HostName git.example.internal
+    User git
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
 ```
 
 Verify access:
 
 ```bash
-ssh internal-git info
+ssh internal-git-admin info
 ```
 
 Clone the admin repository:
 
 ```bash
-git clone internal-git:gitolite-admin
+git clone internal-git-admin:gitolite-admin
 ```
 
 Or without an SSH config alias:
@@ -162,13 +182,18 @@ Deploy the change after review:
 
 ## 5. Add users and devices
 
-One key:
+Add your daily identity. It is separate from the admin identity created by
+`install`, so this key cannot change access rules:
 
 ```bash
 /path/to/mini-git-server.sh user-add \
   --name arthur \
   --key ~/.ssh/id_ed25519.pub
 ```
+
+`user-add` warns when a key is added to an identity that can push to
+`gitolite-admin`, and `repo-set` warns when such an identity is used in a
+repository ACL.
 
 Several computers mapped to the same Gitolite identity:
 
@@ -464,7 +489,7 @@ branch name that was used:
 git push origin --delete trunk
 ```
 
-Check the result with `ssh internal-git info` on the workstation and
+Check the result with `ssh internal-git-admin info` on the workstation and
 `sudo ./mini-git-server.sh doctor` on the server.
 
 ## 9. Agent workflow
@@ -494,6 +519,90 @@ CI runner
 ```
 
 The restriction is enforced by Gitolite on the server, rather than relying only on agent instructions.
+
+## Identities and keys
+
+Gitolite decides who you are only from the SSH key that connects. Any process
+that can use a key **is** that identity. The server-side rules above therefore
+protect you only as far as the keys are kept apart on the client side.
+
+Use three kinds of identities:
+
+| Identity | Example | Access | Where the private key lives |
+|---|---|---|---|
+| Admin | `arthur-admin` | `gitolite-admin` only | Admin workstation; preferably a FIDO2 key (`-sk`) |
+| Daily (owner) | `arthur` | Owner of your repositories | Your workstations |
+| Agent | `agent-impl` | `agent/agent-impl/*`, read elsewhere | Only the agent's own environment |
+
+The admin identity should not be an owner, writer, agent or reader of any
+repository, and no AI agent should ever be able to use the admin or daily
+keys.
+
+### Keeping agent keys apart
+
+An AI agent that runs in your own terminal can usually use every key you can:
+it inherits `SSH_AUTH_SOCK` (your ssh-agent) and can read `~/.ssh`. Gitolite
+then sees your identity, not the agent's. To keep the agent restricted:
+
+- Run each agent as its own Unix user, or in its own container or VM.
+- Give that environment only the agent's private key. Do not mount your
+  `~/.ssh` or forward your ssh-agent into it.
+- Clear `SSH_AUTH_SOCK` in the agent's environment, and use
+  `IdentityAgent none` and `IdentitiesOnly yes` in its SSH configuration.
+- Protect the admin key (and ideally the daily key) with a FIDO2 security
+  key. An agent cannot press the button, even if it can reach the key.
+- Give each agent role its own identity. Several hosts may share one
+  identity by using `--key-id`, but then they also share one branch
+  namespace.
+
+Example SSH configuration inside an agent environment:
+
+```sshconfig
+Host internal-git
+    HostName git.example.internal
+    User git
+    Port 2222
+    IdentityFile ~/.ssh/agent-impl
+    IdentitiesOnly yes
+    IdentityAgent none
+```
+
+An agent can check which identity it really has:
+
+```bash
+ssh internal-git info
+```
+
+The first line names the identity, for example `hello agent-impl, this is
+git@...`. If it shows your own name, the agent can use your keys.
+
+### Moving admin rights to a separate identity
+
+Older examples used the same name for the admin and the daily identity. To
+move admin rights to `arthur-admin` without locking yourself out:
+
+1. Create the admin key (step 1) and add it:
+
+   ```bash
+   /path/to/mini-git-server.sh user-add \
+     --name arthur-admin \
+     --key ~/.ssh/gitolite-admin.pub
+   ```
+
+2. In `conf/gitolite.conf`, add the new identity to the `gitolite-admin`
+   rule, for example `RW+ = arthur arthur-admin`. Then run
+   `git add conf/gitolite.conf` and `apply`.
+3. Point the admin working tree at the admin key and check it:
+
+   ```bash
+   git remote set-url origin internal-git-admin:gitolite-admin
+   ssh internal-git-admin info
+   ```
+
+   The output must list `R W` for `gitolite-admin`.
+4. Remove the old identity from the `gitolite-admin` rule
+   (`RW+ = arthur-admin`), then `git add conf/gitolite.conf` and `apply`.
+   `arthur` keeps its keys and stays the owner of your repositories.
 
 ## 10. Server health checks
 

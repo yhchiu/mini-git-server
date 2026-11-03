@@ -145,6 +145,57 @@ find_admin_dir() {
   printf '%s\n' "$dir"
 }
 
+# Print the Gitolite user that a keydir file name maps to. This copies
+# Gitolite's own rule: "foo.pub" and "foo@laptop.pub" map to "foo", while
+# "foo@example.com.pub" (a dot after the '@') maps to "foo@example.com".
+gitolite_user_for_keyfile() {
+  local base=${1##*/}
+  printf '%s\n' "$base" | sed -E 's/(@[^.]+)?\.pub$//'
+}
+
+# Print every keydir file (relative to the admin directory) that maps to
+# the Gitolite user NAME.
+identity_key_files() {
+  local dir=$1 name=$2 file
+  [[ -d "$dir/keydir" ]] || return 0
+  while IFS= read -r -d '' file; do
+    if [[ $(gitolite_user_for_keyfile "$file") == "$name" ]]; then
+      printf '%s\n' "${file#"$dir/"}"
+    fi
+  done < <(find "$dir/keydir" -type f -name '*.pub' -print0 | sort -z)
+}
+
+# Print the users that may push to gitolite-admin, read from the
+# gitolite-admin block of conf/gitolite.conf. Group names (@...) are skipped.
+admin_identities() {
+  local dir=$1
+  awk '
+    /^[[:space:]]*repo[[:space:]]/ {
+      in_admin = 0
+      for (i = 2; i <= NF; i++) if ($i == "gitolite-admin") in_admin = 1
+      next
+    }
+    in_admin && /^[[:space:]]*RW/ && index($0, "=") {
+      sub(/#.*/, "")
+      split($0, parts, "=")
+      n = split(parts[2], users, " ")
+      for (i = 1; i <= n; i++)
+        if (users[i] !~ /^@/ && !seen[users[i]]++) print users[i]
+    }
+  ' "$dir/conf/gitolite.conf"
+}
+
+# Succeed if NAME is one of the words in the space-separated LIST.
+list_has() {
+  local list=$1 name=$2 item
+  local -a items=()
+  IFS=' ' read -r -a items <<<"$list"
+  for item in "${items[@]}"; do
+    [[ $item == "$name" ]] && return 0
+  done
+  return 1
+}
+
 ensure_clean_or_staged_admin_repo() {
   local dir=$1
   git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not a Git working tree: $dir"
@@ -865,6 +916,9 @@ user_add() {
   if [[ -e $dest && $replace -ne 1 ]]; then
     die "Key already exists: ${dest#"$dir/"} (use --replace to replace it)"
   fi
+  if list_has "$(admin_identities "$dir" | tr '\n' ' ')" "$name"; then
+    warn "'$name' can push to gitolite-admin and change every access rule. Keep this key off machines where AI agents run (see README: Identities and keys)."
+  fi
   mkdir -p "$(dirname "$dest")"
   cp "$key" "$dest"
   chmod 0644 "$dest"
@@ -999,6 +1053,16 @@ repo_set() {
   fi
   encoded=$(repo_fragment_name "$repo")
   fragment="$dir/conf/repos/$encoded.conf"
+
+  local admins identity
+  local -a identities=()
+  admins=$(admin_identities "$dir" | tr '\n' ' ')
+  IFS=' ' read -r -a identities <<<"$owner $writers $agents $readers"
+  for identity in "${identities[@]}"; do
+    if list_has "$admins" "$identity"; then
+      warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
+    fi
+  done
 
   {
     printf '# Managed by mini-git-server.sh\n'

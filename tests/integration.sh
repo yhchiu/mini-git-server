@@ -158,7 +158,7 @@ test_init_keeps_admin_repo_on_master() {
   (
     # shellcheck source=/dev/null
     source "$SCRIPT"
-    init_hosting_account "$GL_USER" "$KEYS/admin.pub" arthur trunk
+    init_hosting_account "$GL_USER" "$KEYS/admin.pub" arthur-admin trunk
   )
 
   local admin_repo="$GL_HOME/repositories/gitolite-admin.git"
@@ -199,7 +199,7 @@ test_doctor_lints_authorized_keys_without_terminal() {
 
 test_admin_workflow_is_applied() {
   local name
-  for name in agent-impl agent-fix dev1 ci; do
+  for name in arthur agent-impl agent-fix dev1 ci; do
     ssh-keygen -q -t ed25519 -N '' -C "$name" -f "$KEYS/$name"
   done
 
@@ -207,6 +207,8 @@ test_admin_workflow_is_applied() {
   assert_eq 'master' "$(git -C "$ADMIN" branch --show-current)"
 
   client "$SCRIPT" admin-init --admin-dir "$ADMIN"
+  # Daily identity, separate from the admin identity arthur-admin.
+  client "$SCRIPT" user-add --admin-dir "$ADMIN" --name arthur --key "$KEYS/arthur.pub"
   client "$SCRIPT" user-add --admin-dir "$ADMIN" --name agent-impl --key "$KEYS/agent-impl.pub" --key-id host1
   client "$SCRIPT" user-add --admin-dir "$ADMIN" --name agent-fix --key "$KEYS/agent-fix.pub" --key-id host1
   client "$SCRIPT" user-add --admin-dir "$ADMIN" --name dev1 --key "$KEYS/dev1.pub"
@@ -235,7 +237,7 @@ test_gitolite_enforces_agent_acl() {
   git init --quiet -b trunk "$WORK"
   git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
     commit --quiet --allow-empty -m 'first'
-  expect_push allow admin 'trunk:refs/heads/trunk'
+  expect_push allow arthur 'trunk:refs/heads/trunk'
 
   git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
     commit --quiet --allow-empty -m 'second'
@@ -261,7 +263,10 @@ test_gitolite_enforces_agent_acl() {
   client git ls-remote as-ci:project-x refs/heads/trunk | grep -q 'refs/heads/trunk'
 
   # The owner may rewind the protected branch.
-  expect_push allow admin '+HEAD:refs/heads/trunk'
+  expect_push allow arthur '+HEAD:refs/heads/trunk'
+
+  # The admin identity has no access to project repositories at all.
+  expect_push deny admin 'HEAD:refs/heads/admin-test'
 }
 
 test_fsck_checks_every_repository() {

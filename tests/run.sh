@@ -77,6 +77,23 @@ CONF
 }
 
 
+# Create a fake ssh-keygen in TMP/bin and print that directory. Tests use it
+# to check key placement without needing openssh-client.
+fake_ssh_keygen() {
+  local tmp=$1
+  mkdir -p "$tmp/bin"
+  cat >"$tmp/bin/ssh-keygen" <<'SH'
+#!/usr/bin/env sh
+if [ "${1:-}" = "-l" ] || [ "${1:-}" = "-lf" ]; then
+  echo "256 SHA256:test test@example.invalid (ED25519)"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$tmp/bin/ssh-keygen"
+  printf '%s\n' "$tmp/bin"
+}
+
 run_test() {
   local name=$1 fn=$2
   if ( "$fn" ); then
@@ -477,6 +494,62 @@ test_repo_set_default_keeps_admin_repo_on_master() {
   assert_eq 'refs/heads/master' "$(git -C "$bare" symbolic-ref HEAD)"
 }
 
+test_gitolite_user_for_keyfile_matches_gitolite() {
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  assert_eq 'arthur' "$(gitolite_user_for_keyfile keydir/desktop/arthur.pub)"
+  assert_eq 'arthur' "$(gitolite_user_for_keyfile keydir/arthur@laptop.pub)"
+  assert_eq 'a@example.com' "$(gitolite_user_for_keyfile keydir/a@example.com.pub)"
+}
+
+test_admin_identities_reads_gitolite_admin_block() {
+  local tmp repo
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  cat >"$repo/conf/gitolite.conf" <<'CONF'
+repo gitolite-admin
+    RW+     =   arthur-admin @admins   # comment
+    R       =   auditor
+
+repo testing
+    RW+     =   @all
+CONF
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  assert_eq 'arthur-admin' "$(admin_identities "$repo")"
+}
+
+test_user_add_warns_for_admin_identity() {
+  local tmp repo key fakebin out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  key="$tmp/admin2.pub"
+  fakebin=$(fake_ssh_keygen "$tmp")
+  new_admin_repo "$repo"
+  printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdminSecondKey admin@example.invalid' >"$key"
+
+  out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name admin --key "$key" --key-id laptop 2>&1)
+  assert_contains "$out" "'admin' can push to gitolite-admin"
+
+  out=$(PATH="$fakebin:$PATH" "$SCRIPT" user-add --admin-dir "$repo" --name arthur --key "$key" --key-id laptop 2>&1)
+  assert_not_contains "$out" 'can push to gitolite-admin'
+}
+
+test_repo_set_warns_when_admin_identity_is_used() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner admin 2>&1)
+  assert_contains "$out" "'admin' is also a gitolite-admin identity"
+
+  out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur 2>&1)
+  assert_not_contains "$out" 'gitolite-admin identity'
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -497,6 +570,10 @@ run_test 'apply refuses a detached HEAD' test_apply_refuses_detached_head
 run_test 'repo-set-default supports an unborn branch' test_repo_set_default_unborn_branch
 run_test 'repo-set-default --require-existing rejects a missing branch' test_repo_set_default_require_existing_rejects_missing
 run_test 'repo-set-default keeps gitolite-admin on master' test_repo_set_default_keeps_admin_repo_on_master
+run_test 'keydir file names map to users like Gitolite does' test_gitolite_user_for_keyfile_matches_gitolite
+run_test 'admin identities are read from the gitolite-admin block' test_admin_identities_reads_gitolite_admin_block
+run_test 'user-add warns when adding a key to an admin identity' test_user_add_warns_for_admin_identity
+run_test 'repo-set warns when an admin identity is used in an ACL' test_repo_set_warns_when_admin_identity_is_used
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
