@@ -44,6 +44,9 @@ Admin-workstation commands (run inside or against a gitolite-admin clone):
   repo-add        Alias for repo-set (backward compatibility)
   repo-show       Show repository ACL state and a reusable repo-set command
   repo-list       List configured repositories
+  group-set       Create/replace a script-managed group (@NAME)
+  group-remove    Remove a script-managed group
+  group-list      List script-managed groups
   sync            Update gitolite-admin from origin, keeping staged changes
   apply           Review, commit and push gitolite-admin changes
 
@@ -226,6 +229,7 @@ validate_agent_names() {
   local -a items=()
   IFS=' ' read -r -a items <<<"$1"
   for item in "${items[@]}"; do
+    [[ $item == @* ]] && continue
     [[ $item =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
       die "Agent name '$item' may only use letters, digits, '-' and '_'. Gitolite puts it into the branch rule agent/USER/, where '.' or '@' would change what the rule matches."
   done
@@ -977,12 +981,21 @@ admin_init_usage() {
 Usage:
   mini-git-server.sh admin-init [--admin-dir DIR]
 
-Adds this line to conf/gitolite.conf if missing:
+Makes sure conf/gitolite.conf contains these lines, in this order:
+  include "groups/*.conf"
   include "repos/*.conf"
 
-and creates conf/repos/. Script-managed repo ACLs are stored there.
+and creates conf/groups/ and conf/repos/. Script-managed groups and
+repository ACLs are stored there. Gitolite needs a group to be defined
+before a rule uses it, so the groups include always comes first.
+
+Running it again is safe. On a working tree set up by an older version, it
+adds the groups include in front of the existing repos include.
 USAGE
 }
+
+ADMIN_GROUPS_INCLUDE='include "groups/*.conf"'
+ADMIN_REPOS_INCLUDE='include "repos/*.conf"'
 
 admin_init() {
   local requested=""
@@ -993,18 +1006,35 @@ admin_init() {
       *) die "Unknown admin-init option: $1" ;;
     esac
   done
-  local dir
+  local dir conf tmp
   dir=$(find_admin_dir "$requested")
   ensure_clean_or_staged_admin_repo "$dir"
-  mkdir -p "$dir/conf/repos"
-  if ! grep -Fqx 'include "repos/*.conf"' "$dir/conf/gitolite.conf"; then
-    printf '\n# Script-managed repository ACLs\ninclude "repos/*.conf"\n' >>"$dir/conf/gitolite.conf"
-    log "Added include \"repos/*.conf\" to conf/gitolite.conf"
+  conf="$dir/conf/gitolite.conf"
+  mkdir -p "$dir/conf/repos" "$dir/conf/groups"
+
+  if ! grep -Fqx "$ADMIN_REPOS_INCLUDE" "$conf"; then
+    printf '\n# Script-managed groups and repository ACLs\n%s\n' "$ADMIN_REPOS_INCLUDE" >>"$conf"
+    log "Added $ADMIN_REPOS_INCLUDE to conf/gitolite.conf"
   else
     log "Repository fragment include already present"
   fi
-  touch "$dir/conf/repos/.gitkeep"
-  git -C "$dir" add conf/gitolite.conf conf/repos/.gitkeep
+
+  # Put the groups include directly before the first repos include, and
+  # nowhere else.
+  tmp=$(mktemp)
+  awk -v g="$ADMIN_GROUPS_INCLUDE" -v r="$ADMIN_REPOS_INCLUDE" '
+    $0 == g { next }
+    $0 == r && !done { print g; done = 1 }
+    { print }
+  ' "$conf" >"$tmp"
+  if ! cmp -s "$tmp" "$conf"; then
+    cat "$tmp" >"$conf"
+    log "Placed $ADMIN_GROUPS_INCLUDE before $ADMIN_REPOS_INCLUDE in conf/gitolite.conf"
+  fi
+  rm -f "$tmp"
+
+  touch "$dir/conf/repos/.gitkeep" "$dir/conf/groups/.gitkeep"
+  git -C "$dir" add conf/gitolite.conf conf/repos/.gitkeep conf/groups/.gitkeep
   git -C "$dir" status --short
 }
 
@@ -1203,6 +1233,237 @@ user_list() {
   done < <(find "$dir/keydir" -type f -name '*.pub' -print0 | sort -z)
 }
 
+GROUP_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+
+validate_group_name() {
+  local name=$1
+  [[ $name =~ $GROUP_NAME_RE ]] || die "Invalid group name: $name"
+  [[ $name != all ]] || die "'all' is Gitolite's built-in group @all. Choose another name."
+}
+
+# A space-separated ACL list may contain users and @groups.
+validate_acl_list() {
+  local item
+  local -a items=()
+  IFS=' ' read -r -a items <<<"${1:-}"
+  for item in "${items[@]}"; do
+    if [[ $item == @* ]]; then
+      [[ $item == @all || ${item#@} =~ $GROUP_NAME_RE ]] || die "Invalid group name in ACL: $item"
+    else
+      validate_simple_name "$item" "ACL user"
+    fi
+  done
+}
+
+group_fragment_path() {
+  printf '%s/conf/groups/%s.conf' "$1" "$2"
+}
+
+# Print the members of a group managed by group-set. Fails if the group is
+# not managed by this script.
+managed_group_members() {
+  local file
+  file=$(group_fragment_path "$1" "$2")
+  [[ -f $file ]] || return 1
+  sed -n 's/^# mini-git-server: members=//p' "$file"
+}
+
+# Print LIST with every managed @group replaced by its members. @all and
+# groups not managed by group-set stay as they are. With OVERRIDE_NAME and
+# OVERRIDE_MEMBERS, that group uses those members instead (group-set uses
+# this to check a change before writing it).
+expand_groups() {
+  local dir=$1 list=$2 override_name=${3:-} override_members=${4:-}
+  local item name members out=""
+  local -a items=()
+  IFS=' ' read -r -a items <<<"$list"
+  for item in "${items[@]}"; do
+    members=$item
+    if [[ $item == @* && $item != @all ]]; then
+      name=${item#@}
+      if [[ -n $override_name && $name == "$override_name" ]]; then
+        members=$override_members
+      elif ! members=$(managed_group_members "$dir" "$name"); then
+        members=$item
+      fi
+    fi
+    out+="${out:+ }$members"
+  done
+  csv_to_spaces "$out"
+}
+
+# Check the roles of one repository ACL, with managed groups replaced by
+# their members. Extra arguments are passed on to expand_groups.
+check_repo_roles() {
+  local dir=$1 owner=$2 writers=$3 agents=$4 readers=$5
+  shift 5
+  writers=$(expand_groups "$dir" "$writers" "$@")
+  agents=$(expand_groups "$dir" "$agents" "$@")
+  readers=$(expand_groups "$dir" "$readers" "$@")
+  validate_agent_names "$agents"
+  check_role_overlap owner "$owner" writer "$writers" agent "$agents" reader "$readers"
+}
+
+# Print one "# mini-git-server: KEY=" metadata value of a repo fragment.
+fragment_meta() {
+  sed -n "s/^# mini-git-server: $2=//p" "$1" | head -n 1
+}
+
+# Warn about identities that have no key, or that are admin identities.
+warn_about_identities() {
+  local dir=$1 list=$2 admins identity
+  local -a identities=()
+  admins=$(admin_identities "$dir" | tr '\n' ' ')
+  IFS=' ' read -r -a identities <<<"$list"
+  for identity in "${identities[@]}"; do
+    [[ $identity == @* ]] && continue
+    if list_has "$admins" "$identity"; then
+      warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
+    fi
+    if [[ -z $(identity_key_files "$dir" "$identity") ]]; then
+      warn "No key in keydir for '$identity'. Its rules have no effect until a key is added with user-add. Check the spelling."
+    fi
+  done
+}
+
+group_set_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh group-set --name NAME --members LIST [--admin-dir DIR]
+
+Create or replace the Gitolite group @NAME in conf/groups/NAME.conf.
+
+Options:
+  --name NAME        Group name, with or without the leading '@'
+  --members LIST     Comma/space-separated users (no nested groups)
+  --admin-dir DIR    gitolite-admin working tree (default: current dir)
+  -h, --help
+
+Use the group in repo-set lists, for example '--agents @agents'. Changing the
+members later changes every repository that uses the group, without running
+repo-set again. Every managed repository that uses the group is checked with
+the new members first, so no member ends up with two roles in one
+repository. The change is staged; run 'apply' after reviewing it.
+USAGE
+}
+
+group_set() {
+  local name="" members="" requested=""
+  while (($#)); do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die "--name requires a value"; name=$2; shift 2 ;;
+      --members) [[ $# -ge 2 ]] || die "--members requires a value"; members=$2; shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) group_set_usage; return 0 ;;
+      *) die "Unknown group-set option: $1" ;;
+    esac
+  done
+  [[ -n $name ]] || die "--name is required"
+  name=${name#@}
+  validate_group_name "$name"
+  members=$(csv_to_spaces "$members")
+  [[ -n $members ]] || die "--members must list at least one user. Use group-remove to delete a group."
+  validate_user_list "$members"
+
+  local dir fragment repo err
+  dir=$(find_admin_dir "$requested")
+  grep -Fqx "$ADMIN_GROUPS_INCLUDE" "$dir/conf/gitolite.conf" || \
+    die "Group fragments are not enabled. Run 'admin-init' first (it is safe to run again)."
+
+  # Check every managed repository that uses this group, with the new members.
+  while IFS= read -r -d '' fragment; do
+    grep -Fq '# mini-git-server: owner=' "$fragment" || continue
+    if ! list_has "$(fragment_meta "$fragment" writers) $(fragment_meta "$fragment" agents) $(fragment_meta "$fragment" readers)" "@$name"; then
+      continue
+    fi
+    repo=$(sed -n 's/^# Repository: //p' "$fragment" | head -n 1)
+    if ! err=$( (check_repo_roles "$dir" \
+      "$(fragment_meta "$fragment" owner)" \
+      "$(fragment_meta "$fragment" writers)" \
+      "$(fragment_meta "$fragment" agents)" \
+      "$(fragment_meta "$fragment" readers)" \
+      "$name" "$members") 2>&1 ); then
+      die "With these members, the ACL of repository '$repo' would be invalid: ${err#\[ERROR\] }"
+    fi
+  done < <(find "$dir/conf/repos" -type f -name '*.conf' -print0 2>/dev/null | sort -z)
+
+  warn_about_identities "$dir" "$members"
+
+  mkdir -p "$dir/conf/groups"
+  fragment=$(group_fragment_path "$dir" "$name")
+  {
+    printf '# Managed by mini-git-server.sh\n'
+    printf '# Group: @%s\n' "$name"
+    printf '# mini-git-server: members=%s\n' "$members"
+    printf '@%s = %s\n' "$name" "$members"
+  } >"$fragment"
+  git -C "$dir" add "${fragment#"$dir/"}"
+  log "Staged group @$name: ${fragment#"$dir/"}"
+}
+
+group_remove_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh group-remove --name NAME [--admin-dir DIR]
+
+Remove a group created by group-set. Refused while an access rule still uses
+the group.
+USAGE
+}
+
+group_remove() {
+  local name="" requested=""
+  while (($#)); do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die "--name requires a value"; name=$2; shift 2 ;;
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) group_remove_usage; return 0 ;;
+      *) die "Unknown group-remove option: $1" ;;
+    esac
+  done
+  [[ -n $name ]] || die "--name is required"
+  name=${name#@}
+  validate_group_name "$name"
+  local dir fragment refs
+  dir=$(find_admin_dir "$requested")
+  fragment=$(group_fragment_path "$dir" "$name")
+  [[ -f $fragment ]] || die "Group @$name is not managed by group-set (no ${fragment#"$dir/"})"
+  refs=$(acl_references "$dir" "@$name" | paste -sd ' ' -)
+  [[ -z $refs ]] || die "Group @$name is still used in: $refs. Remove it from those ACLs first."
+  if git -C "$dir" ls-files --error-unmatch -- "${fragment#"$dir/"}" >/dev/null 2>&1; then
+    git -C "$dir" rm --quiet -f -- "${fragment#"$dir/"}"
+  else
+    rm -f -- "$fragment"
+  fi
+  log "Staged removal of group @$name"
+}
+
+group_list_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh group-list [--admin-dir DIR]
+
+List the groups managed by group-set and their members.
+USAGE
+}
+
+group_list() {
+  local requested=""
+  while (($#)); do
+    case "$1" in
+      --admin-dir) [[ $# -ge 2 ]] || die "--admin-dir requires a value"; requested=$2; shift 2 ;;
+      -h|--help) group_list_usage; return 0 ;;
+      *) die "Unknown group-list option: $1" ;;
+    esac
+  done
+  local dir file name
+  dir=$(find_admin_dir "$requested")
+  while IFS= read -r -d '' file; do
+    name=$(basename "$file" .conf)
+    printf '@%s: %s\n' "$name" "$(managed_group_members "$dir" "$name")"
+  done < <(find "$dir/conf/groups" -type f -name '*.conf' -print0 2>/dev/null | sort -z)
+}
+
 repo_set_usage() {
   cat <<'USAGE'
 Usage:
@@ -1229,6 +1490,9 @@ never pushes; run 'apply' after reviewing the staged diff.
 Each identity may have only one role (owner, writer, agent or reader). Agent
 names may only use letters, digits, '-' and '_'. A warning is shown for any
 identity that has no key in keydir yet.
+
+Lists may contain groups created by group-set, for example '--agents @agents'.
+Group members are checked like users listed directly.
 USAGE
 }
 
@@ -1254,11 +1518,9 @@ repo_set() {
   writers=$(csv_to_spaces "$writers")
   readers=$(csv_to_spaces "$readers")
   agents=$(csv_to_spaces "$agents")
-  validate_user_list "$writers"
-  validate_user_list "$readers"
-  validate_user_list "$agents"
-  validate_agent_names "$agents"
-  check_role_overlap owner "$owner" writer "$writers" agent "$agents" reader "$readers"
+  validate_acl_list "$writers"
+  validate_acl_list "$readers"
+  validate_acl_list "$agents"
   local branch
   for branch in "${protected_branches[@]}"; do
     validate_branch_name "$branch"
@@ -1273,16 +1535,14 @@ repo_set() {
   encoded=$(repo_fragment_name "$repo")
   fragment="$dir/conf/repos/$encoded.conf"
 
-  local admins identity
-  local -a identities=()
-  admins=$(admin_identities "$dir" | tr '\n' ' ')
-  IFS=' ' read -r -a identities <<<"$owner $writers $agents $readers"
-  for identity in "${identities[@]}"; do
-    if list_has "$admins" "$identity"; then
-      warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
-    fi
-    if [[ -z $(identity_key_files "$dir" "$identity") ]]; then
-      warn "No key in keydir for '$identity'. Its rules have no effect until a key is added with user-add. Check the spelling."
+  check_repo_roles "$dir" "$owner" "$writers" "$agents" "$readers"
+  warn_about_identities "$dir" "$(expand_groups "$dir" "$owner $writers $agents $readers")"
+  local item
+  local -a items=()
+  IFS=' ' read -r -a items <<<"$writers $agents $readers"
+  for item in "${items[@]}"; do
+    if [[ $item == @* && $item != @all ]] && ! managed_group_members "$dir" "${item#@}" >/dev/null; then
+      warn "Group '$item' is not managed by group-set. Make sure conf/gitolite.conf defines it before the repos include, or rules that use it match nobody."
     fi
   done
 
@@ -1711,6 +1971,9 @@ main() {
     repo-add)     repo_add "$@" ;;
     repo-show)    repo_show "$@" ;;
     repo-list)    repo_list "$@" ;;
+    group-set)    group_set "$@" ;;
+    group-remove) group_remove "$@" ;;
+    group-list)   group_list "$@" ;;
     sync)         admin_sync "$@" ;;
     apply)        admin_apply "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;

@@ -117,12 +117,18 @@ client() {
     "$@"
 }
 
-# expect_push allow|deny KEYNAME REFSPEC
+# expect_push allow|deny KEYNAME REFSPEC [REPO]
 # A denial only counts when Gitolite itself reports it, so a broken test
-# harness cannot make the ACL checks pass.
+# harness cannot make the ACL checks pass. A push that changes nothing is
+# an error too: Git skips it without asking Gitolite. REPO defaults to
+# project-x.
 expect_push() {
-  local expected=$1 key=$2 refspec=$3 out result
-  if out=$(client git -C "$WORK" push --quiet "as-$key:project-x" "$refspec" 2>&1); then
+  local expected=$1 key=$2 refspec=$3 repo=${4:-project-x} out result
+  if out=$(client git -C "$WORK" push --porcelain "as-$key:$repo" "$refspec" 2>&1); then
+    if [[ $out == *'[up to date]'* ]]; then
+      printf '  %s pushing %s to %s changed nothing, so it tests nothing\n' "$key" "$refspec" "$repo"
+      return 1
+    fi
     result=allow
   else
     result=deny
@@ -135,7 +141,7 @@ expect_push() {
     printf '  %s pushing %s: expected %s, got %s\n%s\n' "$key" "$refspec" "$expected" "$result" "$out"
     return 1
   }
-  printf '  %-5s %-11s %s\n' "$result" "$key" "$refspec"
+  printf '  %-5s %-11s %s %s\n' "$result" "$key" "$repo" "$refspec"
 }
 
 refs_of() {
@@ -283,6 +289,33 @@ test_gitolite_enforces_agent_acl() {
   expect_push deny admin 'HEAD:refs/heads/admin-test'
 }
 
+test_groups_apply_to_every_repository_using_them() {
+  ssh-keygen -q -t ed25519 -N '' -C agent-new -f "$KEYS/agent-new"
+  client "$SCRIPT" user-add --admin-dir "$ADMIN" --name agent-new --key "$KEYS/agent-new.pub"
+  client "$SCRIPT" group-set --admin-dir "$ADMIN" --name agents --members agent-impl,agent-fix
+  client "$SCRIPT" repo-set --admin-dir "$ADMIN" \
+    --repo project-g \
+    --owner arthur \
+    --agents @agents \
+    --protected-branch trunk
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Add @agents and project-g'
+
+  expect_push allow arthur     'HEAD:refs/heads/trunk' project-g
+  git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
+    commit --quiet --allow-empty -m 'third'
+  expect_push allow agent-impl 'HEAD:refs/heads/agent/agent-impl/g1' project-g
+  expect_push allow agent-fix  'HEAD:refs/heads/agent/agent-fix/g1' project-g
+  expect_push deny  agent-impl 'HEAD:refs/heads/agent/agent-fix/g2' project-g
+  expect_push deny  agent-impl 'HEAD:refs/heads/trunk' project-g
+  expect_push deny  agent-new  'HEAD:refs/heads/agent/agent-new/g1' project-g
+
+  # Adding a member only needs group-set; repo-set is not run again.
+  client "$SCRIPT" group-set --admin-dir "$ADMIN" --name agents --members agent-impl,agent-fix,agent-new
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Add agent-new to @agents'
+  expect_push allow agent-new  'HEAD:refs/heads/agent/agent-new/g1' project-g
+  expect_push deny  agent-new  'HEAD:refs/heads/agent/agent-impl/g9' project-g
+}
+
 test_two_admin_machines_with_sync() {
   local laptop="$TMP/gitolite-admin-laptop" out
   client git clone --quiet as-admin:gitolite-admin "$laptop"
@@ -389,6 +422,7 @@ step 'doctor lints authorized_keys when stdin is not a terminal' test_doctor_lin
 step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_applied
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
+step 'groups apply to every repository that uses them' test_groups_apply_to_every_repository_using_them
 step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync
 step 'sshd accepts the generated hardening drop-in' test_sshd_accepts_hardening_dropin
 step 'fsck checks every repository' test_fsck_checks_every_repository

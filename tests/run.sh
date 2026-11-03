@@ -790,6 +790,108 @@ test_ssh_hardening_dropin_accepts_git_protocol_for_git_user_only() {
     END { exit !found }'
 }
 
+test_admin_init_puts_groups_include_before_repos_include() {
+  local tmp repo order
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  # A working tree initialized by an older version: only the repos include.
+  printf '\ninclude "repos/*.conf"\n' >>"$repo/conf/gitolite.conf"
+
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  order=$(grep -E '^include ' "$repo/conf/gitolite.conf" | paste -sd '|' -)
+  assert_eq 'include "groups/*.conf"|include "repos/*.conf"' "$order"
+  [[ -f "$repo/conf/groups/.gitkeep" ]]
+}
+
+test_group_set_and_repo_set_with_group() {
+  local tmp repo content out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  "$SCRIPT" group-set --admin-dir "$repo" --name @agents --members agent-impl,agent-fix >/dev/null 2>&1
+  content=$(<"$repo/conf/groups/agents.conf")
+  assert_contains "$content" '@agents = agent-impl agent-fix'
+  assert_contains "$content" '# mini-git-server: members=agent-impl agent-fix'
+
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --writers dev1 --agents @agents --protected-branch trunk >/dev/null 2>&1
+  content=$(<"$repo/conf/repos/project-x.conf")
+  assert_contains "$content" 'RW      agent/USER/         =   @agents'
+  assert_contains "$content" '=   dev1 @agents'
+
+  out=$("$SCRIPT" group-list --admin-dir "$repo")
+  assert_eq '@agents: agent-impl agent-fix' "$out"
+  out=$("$SCRIPT" repo-show --admin-dir "$repo" --repo project-x)
+  assert_contains "$out" '--agents @agents'
+}
+
+test_group_members_are_checked_for_role_overlap() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  "$SCRIPT" group-set --admin-dir "$repo" --name agents --members agent-impl,dev1 >/dev/null 2>&1
+
+  # repo-set expands the group: dev1 would be both writer and agent.
+  if out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --writers dev1 --agents @agents 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "'dev1' is both writer and agent"
+
+  # group-set checks the repositories that already use the group.
+  "$SCRIPT" group-set --admin-dir "$repo" --name agents --members agent-impl >/dev/null 2>&1
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --writers dev1 --agents @agents >/dev/null 2>&1
+  if out=$("$SCRIPT" group-set --admin-dir "$repo" --name agents --members agent-impl,dev1 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "repository 'project-x' would be invalid"
+  assert_contains "$out" "'dev1' is both writer and agent"
+  assert_eq '@agents: agent-impl' "$("$SCRIPT" group-list --admin-dir "$repo")"
+
+  # Agent name rules apply to group members too.
+  if out=$("$SCRIPT" group-set --admin-dir "$repo" --name agents --members agent.x 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "Agent name 'agent.x'"
+}
+
+test_group_remove_refuses_group_in_use() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  "$SCRIPT" group-set --admin-dir "$repo" --name readers --members ci >/dev/null 2>&1
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers @readers >/dev/null 2>&1
+
+  if out=$("$SCRIPT" group-remove --admin-dir "$repo" --name readers 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'still used in: conf/repos/project-x.conf'
+
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers ci >/dev/null 2>&1
+  "$SCRIPT" group-remove --admin-dir "$repo" --name readers >/dev/null 2>&1
+  [[ ! -e "$repo/conf/groups/readers.conf" ]]
+}
+
+test_repo_set_warns_about_unmanaged_group() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers @all,@ops 2>&1)
+  assert_contains "$out" "Group '@ops' is not managed by group-set"
+  assert_not_contains "$out" "Group '@all'"
+}
+
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.2.6' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
@@ -825,6 +927,11 @@ run_test 'apply stops when origin is newer, and sync keeps staged changes' test_
 run_test 'sync rebases local commits that were not pushed' test_sync_rebases_unpushed_commits
 run_test 'host-keys prints fingerprints and known_hosts lines' test_host_keys_prints_fingerprints_and_known_hosts_lines
 run_test 'SSH hardening accepts GIT_PROTOCOL for the hosting user only' test_ssh_hardening_dropin_accepts_git_protocol_for_git_user_only
+run_test 'admin-init puts the groups include before the repos include' test_admin_init_puts_groups_include_before_repos_include
+run_test 'group-set creates a group that repo-set can use' test_group_set_and_repo_set_with_group
+run_test 'group members are checked for role overlap and agent names' test_group_members_are_checked_for_role_overlap
+run_test 'group-remove refuses a group that is still used' test_group_remove_refuses_group_in_use
+run_test 'repo-set warns about a group not managed by group-set' test_repo_set_warns_about_unmanaged_group
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

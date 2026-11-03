@@ -47,6 +47,9 @@ repo-set
 repo-add (compatibility alias)
 repo-show
 repo-list
+group-set
+group-remove
+group-list
 sync
 apply
 ```
@@ -174,13 +177,18 @@ Inside the `gitolite-admin` working tree:
 /path/to/mini-git-server.sh admin-init
 ```
 
-This adds:
+This adds, in this order:
 
 ```text
+include "groups/*.conf"
 include "repos/*.conf"
 ```
 
-and stores script-managed repository ACLs under `conf/repos/`.
+and stores script-managed groups under `conf/groups/` and repository ACLs
+under `conf/repos/`. Gitolite needs a group to be defined before a rule uses
+it, so the groups include always comes first. On a working tree set up by an
+older version, run `admin-init` again: it adds the groups include in front
+of the existing repos include.
 
 Deploy the change after review:
 
@@ -370,6 +378,41 @@ state again:
 
 Do not pass only the identities being added. `repo-set` means "make the
 managed ACL look exactly like this."
+
+### Groups
+
+With several agents and several repositories, list the agents once in a
+group and use the group in every repository:
+
+```bash
+/path/to/mini-git-server.sh group-set \
+  --name agents \
+  --members agent-impl,agent-fix
+
+/path/to/mini-git-server.sh repo-set \
+  --repo project-x \
+  --owner arthur \
+  --agents @agents \
+  --readers agent-review,ci \
+  --protected-branch trunk
+```
+
+Each member of `@agents` still gets only its own `agent/<name>/*` branches.
+To add or remove an agent later, run `group-set` with the new member list
+and `apply`. There is no need to run `repo-set` again for each repository.
+
+`group-set` is declarative like `repo-set`: `--members` is the complete
+list. Before writing the group, it checks every managed repository that uses
+the group with the new members, so a member cannot end up with two roles in
+one repository.
+
+```bash
+/path/to/mini-git-server.sh group-list
+/path/to/mini-git-server.sh group-remove --name agents
+```
+
+`group-remove` refuses while a repository still uses the group. Groups may
+be used in `--writers`, `--agents` and `--readers`; `@all` works as usual.
 
 `repo-add` remains available as a backward-compatible alias for `repo-set`.
 New scripts and documentation should use `repo-set`.
