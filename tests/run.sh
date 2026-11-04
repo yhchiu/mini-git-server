@@ -719,6 +719,32 @@ test_repo_set_warns_about_identities_without_keys() {
   assert_not_contains "$out" "No key in keydir for 'arthur'"
 }
 
+test_repo_set_and_group_set_know_gitolite_special_users() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  write_key "$repo/keydir/arthur.pub" ArthurKey
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+
+  # daemon and gitweb have no key, but their rules work: say what they do
+  # instead of warning that they have no effect.
+  out=$("$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers ci,daemon,gitweb 2>&1)
+  assert_not_contains "$out" "No key in keydir for 'daemon'"
+  assert_not_contains "$out" "No key in keydir for 'gitweb'"
+  assert_contains "$out" "'daemon' is Gitolite's user for anonymous reading"
+  assert_contains "$out" 'git-daemon-export-ok'
+  assert_contains "$out" "'gitweb' is Gitolite's user for gitweb"
+  assert_contains "$out" 'projects.list'
+  # Real identities are still checked.
+  assert_contains "$out" "No key in keydir for 'ci'"
+  grep -Fxq '    R                           =   ci daemon gitweb' "$repo/conf/repos/project-x.conf"
+
+  out=$("$SCRIPT" group-set --admin-dir "$repo" --name public --members daemon 2>&1)
+  assert_not_contains "$out" "No key in keydir for 'daemon'"
+  assert_contains "$out" "'daemon' is Gitolite's user for anonymous reading"
+}
+
 # Create TMP/origin.git (with admin-init applied) and two working trees,
 # TMP/desktop and TMP/laptop, as if on two machines.
 new_admin_origin_with_two_clones() {
@@ -1519,6 +1545,7 @@ run_test 'user-remove --all removes every key and warns about remaining ACL entr
 run_test 'repo-set rejects an identity with two roles' test_repo_set_rejects_identity_with_two_roles
 run_test 'repo-set rejects agent names with special characters' test_repo_set_rejects_agent_names_with_special_characters
 run_test 'repo-set warns about identities without keys' test_repo_set_warns_about_identities_without_keys
+run_test 'repo-set and group-set do not warn about the keyless daemon and gitweb users' test_repo_set_and_group_set_know_gitolite_special_users
 run_test 'apply stops when origin is newer, and sync keeps staged changes' test_apply_stops_when_behind_and_sync_keeps_staged_changes
 run_test 'sync rebases local commits that were not pushed' test_sync_rebases_unpushed_commits
 run_test 'host-keys prints fingerprints and known_hosts lines' test_host_keys_prints_fingerprints_and_known_hosts_lines

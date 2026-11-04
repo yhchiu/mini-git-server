@@ -1561,6 +1561,18 @@ warn_about_identities() {
   IFS=' ' read -r -a identities <<<"$list"
   for identity in "${identities[@]}"; do
     [[ $identity == @* ]] && continue
+    # Gitolite's special users have no key. Its triggers act on their read
+    # access instead, so say what that does rather than warn.
+    case $identity in
+      daemon)
+        log "'daemon' is Gitolite's user for anonymous reading and needs no key. Gitolite marks every repository that daemon can read with git-daemon-export-ok, and git daemon or git http-backend, if one runs on the server, serves it to anyone who can reach it."
+        continue
+        ;;
+      gitweb)
+        log "'gitweb' is Gitolite's user for gitweb and needs no key. Gitolite lists every repository that gitweb can read in projects.list, and gitweb, if it runs on the server, shows it."
+        continue
+        ;;
+    esac
     if list_has "$admins" "$identity"; then
       warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
     fi

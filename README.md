@@ -372,7 +372,28 @@ name.
 - Agent names may only use letters, digits, `-` and `_`, because Gitolite
   puts the name into the branch rule `agent/USER/`.
 - It warns about identities that have no key in `keydir/` yet. This usually
-  means a typing mistake, or a key that still has to be added.
+  means a typing mistake, or a key that still has to be added. Gitolite's
+  special users `daemon` and `gitweb` never have a key; for them it says
+  what they do instead (see [Anonymous reading](#anonymous-reading)).
+
+### Anonymous reading
+
+`daemon` and `gitweb` are special users of Gitolite, not identities with
+keys:
+
+- `--readers daemon` makes Gitolite put a `git-daemon-export-ok` file into
+  the repository. `git daemon` and `git http-backend` serve only
+  repositories that have this file, to anyone who can reach them, without a
+  key.
+- `--readers gitweb` lists the repository in `projects.list`, for gitweb.
+
+mini-git-server does not set up `git daemon`, `git http-backend` or gitweb,
+so on its own this makes nothing reachable. It matters as soon as one of
+them runs on the server.
+
+`@all` includes `daemon` and `gitweb`. A repository with `--readers @all`,
+or any other rule for `@all` (such as the `testing` repository that Gitolite
+creates), is marked in the same way.
 
 ### `repo-set` replaces the managed state
 

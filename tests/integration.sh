@@ -341,6 +341,23 @@ test_share_reads_through_gitolite_as_the_caller() {
   cat "$out.err"
 }
 
+test_daemon_reader_exports_the_repository() {
+  local repo="$GL_HOME/repositories/project-public.git" out
+  # daemon has no key, and still does what the message says: Gitolite marks
+  # the repository for git daemon and git http-backend.
+  out=$(client "$SCRIPT" repo-set --admin-dir "$ADMIN" --repo project-public --owner arthur --readers ci,daemon 2>&1)
+  printf '%s\n' "$out"
+  assert_contains "$out" "'daemon' is Gitolite's user for anonymous reading"
+  [[ $out != *"No key in keydir for 'daemon'"* ]] || { printf '  wrong warning about daemon\n'; return 1; }
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Add project-public with anonymous reading'
+  [[ -e $repo/git-daemon-export-ok ]] || { printf '  git-daemon-export-ok was not created\n'; return 1; }
+
+  # Without daemon, Gitolite removes the mark again.
+  client "$SCRIPT" repo-set --admin-dir "$ADMIN" --repo project-public --owner arthur --readers ci
+  client "$SCRIPT" apply --admin-dir "$ADMIN" -m 'Stop anonymous reading of project-public'
+  [[ ! -e $repo/git-daemon-export-ok ]] || { printf '  git-daemon-export-ok was not removed\n'; return 1; }
+}
+
 test_groups_apply_to_every_repository_using_them() {
   ssh-keygen -q -t ed25519 -N '' -C agent-new -f "$KEYS/agent-new"
   client "$SCRIPT" user-add --admin-dir "$ADMIN" --name agent-new --key "$KEYS/agent-new.pub"
@@ -514,6 +531,7 @@ step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_a
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
 step 'share reads through Gitolite with the identity of the caller' test_share_reads_through_gitolite_as_the_caller
+step 'a daemon reader makes Gitolite export the repository, without a key' test_daemon_reader_exports_the_repository
 step 'groups apply to every repository that uses them' test_groups_apply_to_every_repository_using_them
 step '--agent-rewind allows rewinds only in the own namespace, and they are recoverable' test_agent_rewind_is_limited_to_own_branches_and_recoverable
 step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync
