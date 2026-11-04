@@ -44,3 +44,34 @@ jobs:
 
       - name: Run Gitolite integration tests
         run: sudo make test-integration
+
+  # The same checks on the target platform, plus a real install. The job
+  # runs in a throwaway container, so the install test may change it.
+  debian:
+    name: debian-13
+    runs-on: ubuntu-26.04
+    container: debian:trixie
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git make shellcheck openssh-client openssh-server gitolite3
+
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Show tool versions
+        run: |
+          . /etc/os-release && echo "$PRETTY_NAME"
+          git --version
+          dpkg-query -W -f='${Package} ${Version}\n' gitolite3 openssh-server shellcheck
+
+      - name: Run checks
+        run: make check
+
+      - name: Run Gitolite integration tests
+        run: make test-integration
+
+      - name: Run install end-to-end test
+        run: MGS_E2E_DISPOSABLE=1 make test-install

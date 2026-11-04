@@ -18,9 +18,21 @@ sudo make test-integration
 
 GitHub Actions runs them in a separate `integration` job.
 
+Changes to `install` should also pass the install end-to-end test. It runs
+the real `install` and changes the system, so run it only in a throwaway
+Debian 13 container (see "Testing" in the README for a `docker run`
+command):
+
+```bash
+MGS_E2E_DISPOSABLE=1 make test-install
+```
+
+GitHub Actions runs it, together with the other suites, in the `debian-13`
+job.
+
 ## Writing tests
 
-Both test suites run each test with `set -e`: any command that fails stops
+All test suites run each test with `set -e`: any command that fails stops
 the test and marks it as failed, so a plain check such as
 `[[ -f "$file" ]]` works anywhere in a test.
 

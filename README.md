@@ -1019,3 +1019,21 @@ with `--default-branch`, the admin workflow, the generated ACL (with real
 pushes), `status`, `doctor`, `fsck` and `backup`. Run them on a disposable
 machine or container rather than a production Git server.
 
+The install end-to-end test runs the real `install` on Debian 13, then starts
+sshd and checks the result over real SSH connections: host keys, Git
+protocol v2, the admin workflow, access rules, `doctor`, `status` and
+`backup`. It also checks that a second `install` is refused without
+changing anything. It installs packages, creates the `git` account and
+changes `/etc/ssh`, so it refuses to run unless `MGS_E2E_DISPOSABLE=1` is
+set. Run it only in a throwaway container, for example:
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -w /src debian:trixie bash -c '
+  apt-get update &&
+  apt-get install -y --no-install-recommends ca-certificates git make shellcheck openssh-client openssh-server gitolite3 &&
+  make check && make test-integration && MGS_E2E_DISPOSABLE=1 make test-install'
+```
+
+GitHub Actions runs the unit and integration tests on Ubuntu, and all three
+test suites in a Debian 13 container.
+
