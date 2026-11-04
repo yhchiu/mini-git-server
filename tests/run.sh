@@ -1038,6 +1038,63 @@ CONF
   assert_not_contains "$out" 'skipping the lockout check'
 }
 
+# Run server_status with mocked system commands. ROOT is 1 or 0.
+status_with_mocks() {
+  # Not named "root": server_status has a local variable with that name,
+  # and Bash functions see the caller's local variables.
+  local mock_root=$1 home=$2
+  (
+    # shellcheck source=/dev/null
+    source "$SCRIPT"
+    is_root() { (( mock_root )); }
+    id() { return 0; }
+    getent() { printf 'git:x:1000:1000::%s:/bin/bash\n' "$home"; }
+    runuser() { shift 3; "$@"; }
+    # sshd is stopped, and "sshd -T" fails.
+    systemctl() { printf 'inactive\n'; return 3; }
+    sshd() { return 1; }
+    passwd() { printf '%s L 2026-01-01 0 99999 7 -1\n' "$2"; }
+    gitolite() { printf '%s\n' "$home/gitolite-bin"; }
+    server_status --git-user git 2>&1
+  )
+}
+
+test_status_marks_fields_that_need_root() {
+  local tmp home out
+  tmp=$(new_tmp)
+  home="$tmp/git-home"
+  mkdir -p "$home/repositories/demo.git" "$home/gitolite-bin"
+  printf '3.6.12-4 (Debian)\n' >"$home/gitolite-bin/VERSION"
+  git config --file "$home/.gitconfig" init.defaultBranch trunk
+
+  out=$(status_with_mocks 0 "$home")
+  assert_contains "$out" "Not running as root"
+  assert_contains "$out" 'SSH ports:           (needs root)'
+  assert_contains "$out" 'Default branch:      (needs root)'
+  assert_contains "$out" 'Password status:     (needs root)'
+  assert_not_contains "$out" 'Git-default'
+  # The test home is readable, so the repositories can still be counted.
+  assert_contains "$out" 'Repository count:    1'
+  assert_contains "$out" 'Gitolite:            3.6.12-4 (Debian)'
+
+  out=$(status_with_mocks 1 "$home")
+  assert_not_contains "$out" 'Not running as root'
+  assert_contains "$out" 'Default branch:      trunk'
+  assert_contains "$out" 'Password status:     L'
+}
+
+test_status_prints_one_line_per_field() {
+  local tmp home out
+  tmp=$(new_tmp)
+  home="$tmp/git-home"
+  mkdir -p "$home"
+  out=$(status_with_mocks 1 "$home")
+  # A failing command must not leave its output in front of the fallback.
+  assert_contains "$out" $'SSH service:         inactive\nSSH ports:           unknown\nDefault branch:      Git-default\n'
+  assert_contains "$out" 'Gitolite:            unknown'
+  assert_contains "$out" 'Repository count:    0'
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -1060,6 +1117,8 @@ run_test 'apply refuses a detached HEAD' test_apply_refuses_detached_head
 run_test 'repo-set-default supports an unborn branch' test_repo_set_default_unborn_branch
 run_test 'repo-set-default --require-existing rejects a missing branch' test_repo_set_default_require_existing_rejects_missing
 run_test 'repo-set-default keeps gitolite-admin on master' test_repo_set_default_keeps_admin_repo_on_master
+run_test 'status marks the fields that need root' test_status_marks_fields_that_need_root
+run_test 'status prints one line per field when commands fail' test_status_prints_one_line_per_field
 run_test 'keydir file names map to users like Gitolite does' test_gitolite_user_for_keyfile_matches_gitolite
 run_test 'admin identities are read from the gitolite-admin block' test_admin_identities_reads_gitolite_admin_block
 run_test 'admin identities expand groups, nested groups and group-set groups' test_admin_identities_expands_groups

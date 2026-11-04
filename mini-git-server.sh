@@ -62,8 +62,20 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+is_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]]
+}
+
 require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "This command must be run as root."
+  is_root || die "This command must be run as root."
+}
+
+# Print the Gitolite version, or "missing". Gitolite has no --version option;
+# its version is in the VERSION file next to its programs.
+gitolite_version() {
+  local bindir
+  bindir=$(cd / && gitolite query-rc GL_BINDIR 2>/dev/null) || { printf 'missing\n'; return 0; }
+  head -n 1 "$bindir/VERSION" 2>/dev/null || printf 'unknown\n'
 }
 
 validate_simple_name() {
@@ -621,24 +633,57 @@ server_status() {
   validate_unix_user "$git_user"
   id "$git_user" >/dev/null 2>&1 || die "User does not exist: $git_user"
 
-  local git_home
+  local git_home root=1 needs_root="(needs root)" value
   git_home=$(getent passwd "$git_user" | cut -d: -f6)
+  is_root || root=0
+  if (( ! root )); then
+    warn "Not running as root: fields that only root can read show '$needs_root'. Run it with sudo for complete results."
+  fi
   printf 'mini-git-server %s\n\n' "$VERSION"
   printf '%-20s %s\n' "Hosting user:" "$git_user"
   printf '%-20s %s\n' "Home:" "$git_home"
   printf '%-20s %s\n' "Git:" "$(git --version 2>/dev/null || echo missing)"
-  printf '%-20s %s\n' "Gitolite:" "$(gitolite --version 2>/dev/null | head -n1 || echo missing)"
-  printf '%-20s %s\n' "SSH service:" "$(systemctl is-active ssh 2>/dev/null || echo unknown)"
-  printf '%-20s %s\n' "SSH ports:" "$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, - || echo unknown)"
-  printf '%-20s %s\n' "Default branch:" "$(runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global --get init.defaultBranch 2>/dev/null || echo Git-default)"
-  printf '%-20s %s\n' "Password status:" "$(passwd -S "$git_user" 2>/dev/null | awk '{print $2}' || echo unknown)"
+  printf '%-20s %s\n' "Gitolite:" "$(gitolite_version)"
 
-  local repo_count=0
-  if [[ -d "$git_home/repositories" ]]; then
-    repo_count=$(find "$git_home/repositories" -type d -name '*.git' -prune | wc -l)
+  # Each field prints exactly one value. A failing command must not leave
+  # its partial output in front of the fallback text.
+  value=$(systemctl is-active ssh 2>/dev/null | head -n 1) || true
+  printf '%-20s %s\n' "SSH service:" "${value:-unknown}"
+
+  value=$needs_root
+  if (( root )); then
+    value=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, -) || true
+    value=${value:-unknown}
+  fi
+  printf '%-20s %s\n' "SSH ports:" "$value"
+
+  value=$needs_root
+  if (( root )); then
+    value=$(runuser -u "$git_user" -- env HOME="$git_home" git -C "$git_home" config --global --get init.defaultBranch 2>/dev/null) || true
+    value=${value:-Git-default}
+  fi
+  printf '%-20s %s\n' "Default branch:" "$value"
+
+  value=$needs_root
+  if (( root )); then
+    value=$(passwd -S "$git_user" 2>/dev/null | awk '{print $2}') || true
+    value=${value:-unknown}
+  fi
+  printf '%-20s %s\n' "Password status:" "$value"
+
+  # The hosting account's home is often not readable by other users.
+  local repo_count=$needs_root repo_storage=$needs_root
+  if (( root )) || [[ -x $git_home ]]; then
+    repo_count=0
+    repo_storage=n/a
+    if [[ -d "$git_home/repositories" ]]; then
+      repo_count=$(find "$git_home/repositories" -type d -name '*.git' -prune 2>/dev/null | wc -l)
+      repo_storage=$(du -sh "$git_home/repositories" 2>/dev/null | awk '{print $1}') || true
+      repo_storage=${repo_storage:-n/a}
+    fi
   fi
   printf '%-20s %s\n' "Repository count:" "$repo_count"
-  printf '%-20s %s\n' "Repository storage:" "$(du -sh "$git_home/repositories" 2>/dev/null | awk '{print $1}' || echo n/a)"
+  printf '%-20s %s\n' "Repository storage:" "$repo_storage"
   local ssh_port_config="unmanaged" ssh_hardening="not-installed"
   [[ -f $DEFAULT_SSHD_PORT_DROPIN ]] && ssh_port_config="managed"
   [[ -f $DEFAULT_SSHD_DROPIN ]] && ssh_hardening="installed"
@@ -872,7 +917,7 @@ server_backup() {
     printf 'host=%s\n' "$(hostname -f 2>/dev/null || hostname)"
     printf 'git_user=%s\n' "$git_user"
     printf 'git_version=%s\n' "$(git --version)"
-    printf 'gitolite_version=%s\n' "$(gitolite --version 2>/dev/null | head -n1 || true)"
+    printf 'gitolite_version=%s\n' "$(gitolite_version)"
     printf 'repositories=%d\n' "$count"
     printf 'failed=%d\n' "$failed"
     dpkg-query -W -f='package=${binary:Package} version=${Version}\n' git openssh-server gitolite3 2>/dev/null || true

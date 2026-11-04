@@ -884,6 +884,9 @@ sudo ./mini-git-server.sh fsck
 ```
 
 `status` also reports the effective sshd ports and the hosting account's configured Git default branch.
+Run it as root: without root, it says so, and the fields that only root can
+read (for example the sshd ports and the default branch) show `(needs root)`
+instead of a guess.
 
 Check only one repository:
 
