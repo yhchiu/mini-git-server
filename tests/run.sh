@@ -945,6 +945,40 @@ test_repo_set_agent_rewind_and_repo_show_round_trip() {
   assert_contains "$out" '--agent-rewind needs --agents'
 }
 
+# Print the line number of the first line in FILE that equals TEXT.
+line_of() {
+  awk -v t="$2" '$0 == t {print NR; exit}' "$1"
+}
+
+test_repo_set_reserves_tags_for_owner_and_agent_branches_for_agents() {
+  local tmp repo fragment tags agent_ns writers_rw content
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  "$SCRIPT" admin-init --admin-dir "$repo" >/dev/null 2>&1
+  fragment="$repo/conf/repos/project-x.conf"
+
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur \
+    --writers dev1 --agents agent-impl --readers ci >/dev/null 2>&1
+  tags=$(line_of "$fragment" '    -       refs/tags/           =   dev1 agent-impl')
+  agent_ns=$(line_of "$fragment" '    -       agent/               =   dev1')
+  writers_rw=$(line_of "$fragment" '    RW                          =   dev1')
+  [[ -n $tags && -n $agent_ns && -n $writers_rw ]]
+  # Gitolite uses the first matching rule: both denials must come first.
+  (( tags < writers_rw && agent_ns < writers_rw ))
+
+  # Agents only: tags are still denied, but there is no writer rule.
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --agents agent-impl >/dev/null 2>&1
+  content=$(<"$fragment")
+  assert_contains "$content" '    -       refs/tags/           =   agent-impl'
+  assert_not_contains "$content" '    -       agent/ '
+
+  # Owner and readers only: no deny rules are needed.
+  "$SCRIPT" repo-set --admin-dir "$repo" --repo project-x --owner arthur --readers ci >/dev/null 2>&1
+  content=$(<"$fragment")
+  assert_not_contains "$content" '    -       '
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -954,6 +988,7 @@ run_test 'SSH port validation accepts only 1..65535' test_validate_port
 run_test 'admin-init is idempotent' test_admin_init_idempotent
 run_test 'repo-set generates least-privilege agent ACL without hardcoded main' test_repo_set_acl_and_no_hardcoded_main
 run_test 'protected branches are exact and escaped' test_protected_branch_exact_and_escaped
+run_test 'repo-set reserves tags for the owner and agent/ for agents' test_repo_set_reserves_tags_for_owner_and_agent_branches_for_agents
 run_test 'repo-set replaces the complete desired ACL state' test_repo_set_replaces_complete_desired_state
 run_test 'repo-add remains a backward-compatible repo-set alias' test_repo_add_is_repo_set_alias
 run_test 'repo-show prints state, reusable command, and raw fragment' test_repo_show_outputs_state_and_reusable_command

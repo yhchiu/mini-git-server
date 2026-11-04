@@ -275,16 +275,22 @@ test_gitolite_enforces_agent_acl() {
   expect_push deny  agent-impl ':refs/heads/agent/agent-impl/issue-42'
   expect_push allow agent-fix  'HEAD:refs/heads/agent/agent-fix/issue-7'
 
-  # Writers may write anywhere except the protected branch.
+  # Writers may write anywhere except the protected branch, the agent
+  # branches and tags.
   expect_push deny  dev1 'HEAD:refs/heads/trunk'
   expect_push allow dev1 'HEAD:refs/heads/feature'
+  expect_push deny  dev1 'HEAD:refs/heads/agent/agent-fix/from-writer'
+  expect_push deny  dev1 'HEAD:refs/heads/agent/dev1/own-namespace'
+  expect_push deny  dev1 'HEAD:refs/tags/writer-tag'
 
   # Readers can fetch but not push.
   expect_push deny  ci 'HEAD:refs/heads/ci-result'
   client git ls-remote as-ci:project-x refs/heads/trunk | grep -q 'refs/heads/trunk'
 
-  # The owner may rewind the protected branch.
+  # The owner may rewind the protected branch, and is the only one who may
+  # push tags.
   expect_push allow arthur '+HEAD:refs/heads/trunk'
+  expect_push allow arthur 'HEAD:refs/tags/v1'
 
   # The admin identity has no access to project repositories at all.
   expect_push deny admin 'HEAD:refs/heads/admin-test'

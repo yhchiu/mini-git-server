@@ -1483,8 +1483,10 @@ Usage:
 
 Options:
   --repo NAME            Repository name, e.g. project or team/project
-  --owner USER           Human/admin with RW+ to the whole repository
-  --writers LIST         Comma/space-separated users with RW (no force push)
+  --owner USER           Human with RW+ to the whole repository. The owner
+                         is the only identity that can push tags.
+  --writers LIST         Comma/space-separated users with RW (no force push),
+                         except tags and agent/* branches
   --readers LIST         Comma/space-separated read-only users
   --agents LIST          Comma/space-separated agents. Each gets:
                            RW  agent/USER/*
@@ -1575,15 +1577,23 @@ repo_set() {
     done
     printf 'repo %s\n' "$repo"
     printf '    RW+                         =   %s\n' "$owner"
-    if (( ${#protected_branches[@]} > 0 )) && [[ -n ${writers}${agents} ]]; then
-      local protected_users refex
-      protected_users=$(csv_to_spaces "$writers $agents")
+    # Gitolite uses the first rule that matches, so every deny rule must
+    # come before the RW rule of the writers.
+    if [[ -n ${writers}${agents} ]]; then
+      local non_owners refex
+      non_owners=$(csv_to_spaces "$writers $agents")
       for branch in "${protected_branches[@]}"; do
         refex=$(branch_refex_exact "$branch")
-        printf '    -       %-20s =   %s\n' "$refex" "$protected_users"
+        printf '    -       %-20s =   %s\n' "$refex" "$non_owners"
       done
+      # Only the owner may create, move or delete tags.
+      printf '    -       %-20s =   %s\n' 'refs/tags/' "$non_owners"
     fi
-    [[ -n $writers ]] && printf '    RW                          =   %s\n' "$writers"
+    if [[ -n $writers ]]; then
+      # agent/ is reserved for agents; writers may not write there.
+      printf '    -       %-20s =   %s\n' 'agent/' "$writers"
+      printf '    RW                          =   %s\n' "$writers"
+    fi
     if [[ -n $agents ]]; then
       if (( agent_rewind )); then
         printf '    RW+     agent/USER/         =   %s\n' "$agents"

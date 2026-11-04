@@ -18,6 +18,7 @@ Upgrading from an earlier version? See [13. Upgrading](#13-upgrading).
 - Keep Gitolite's standard `gitolite-admin` workflow as the source of truth.
 - Give AI agents separate SSH identities.
 - Let agents push only to their own `agent/USER/*` namespace by default.
+- Keep `agent/*` branches for agents and tags for the repository owner.
 - Do not assume that the primary branch is named `main`.
 - Support explicit protected branches.
 - Separate the repository default branch (`HEAD`) from access-control policy.
@@ -320,8 +321,10 @@ A generated ACL looks conceptually like:
 ```text
 repo project-x
     RW+                         =   arthur
-    -       refs/heads/trunk$   =   developer1 developer2 agent-impl agent-fix
-    -       refs/heads/production$ = developer1 developer2 agent-impl agent-fix
+    -       refs/heads/trunk$    =   developer1 developer2 agent-impl agent-fix
+    -       refs/heads/production$ =   developer1 developer2 agent-impl agent-fix
+    -       refs/tags/           =   developer1 developer2 agent-impl agent-fix
+    -       agent/               =   developer1 developer2
     RW                          =   developer1 developer2
     RW      agent/USER/         =   agent-impl agent-fix
     R                           =   agent-impl agent-fix agent-review ci
@@ -329,12 +332,17 @@ repo project-x
 
 Meaning:
 
-- `arthur` has `RW+` to the repository;
-- normal writers have `RW`, but cannot update protected branches;
+- `arthur` has `RW+` to the repository, and is the only identity that can
+  push tags;
+- normal writers have `RW`, but cannot update protected branches, cannot
+  push tags, and cannot write to `agent/*` branches;
 - `agent-impl` can write only under `agent/agent-impl/*`;
 - `agent-fix` can write only under `agent/agent-fix/*`;
 - agents have `RW`, not `RW+`, so force-pushing their own agent branches is not allowed by default;
 - review and CI identities are read-only.
+
+Gitolite uses the first rule that matches, so all `-` (deny) rules come
+before the writers' `RW` rule.
 
 `--protected-branch` uses an exact branch match. A branch such as
 `release/1.2` is escaped before being written as a Gitolite refex, so regex
@@ -627,6 +635,11 @@ A recommended authorization model is:
 ```text
 Human owner
     entire repository: RW+
+    the only identity that can push tags
+
+Writer
+    branches: RW, except protected branches and agent/*
+    tags: none
 
 Implementation agent
     agent/<its-user>/*: RW

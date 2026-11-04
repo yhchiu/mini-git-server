@@ -37,8 +37,9 @@ you do not waste work on pushes that will be rejected.
   git switch -c agent/<identity>/<topic> origin/<main-branch>
   ```
 
-- Never push to `<main-branch>` or to any branch outside your namespace.
-  You may read every branch, including other agents' branches.
+- Never push to `<main-branch>`, to any branch outside your namespace, or
+  tags. Only the repository owner pushes tags. You may read every branch,
+  including other agents' branches.
 
 ### Rewriting your branches
 
