@@ -94,13 +94,36 @@ SH
   printf '%s\n' "$tmp/bin"
 }
 
+# Run one test function in a subshell and record the result.
+#
+# The test must not run as the condition of an "if" (as in
+# "if ( "$fn" ); then"): Bash turns errexit off there, so a failing check in
+# the middle of a test would be ignored and only the last command would
+# count. Instead, run it as a plain command with errexit switched on inside
+# the subshell, and read its exit status afterwards.
 run_test() {
-  local name=$1 fn=$2
-  if ( "$fn" ); then
+  local name=$1 fn=$2 rc
+  set +e
+  ( set -e; "$fn" )
+  rc=$?
+  set -e
+  if (( rc == 0 )); then
     pass "$name"
   else
     fail "$name"
   fi
+}
+
+test_run_test_catches_a_failed_check_in_the_middle() {
+  fails_in_the_middle() {
+    [[ -e /nonexistent/mini-git-server-test ]]
+    true
+  }
+  local out
+  # Run in a command substitution, so the inner result does not change the
+  # pass/fail counters of this test run.
+  out=$(run_test 'inner test' fails_in_the_middle 2>&1)
+  assert_contains "$out" 'not ok - inner test'
 }
 
 test_bash_syntax() {
@@ -922,6 +945,7 @@ test_repo_set_agent_rewind_and_repo_show_round_trip() {
   assert_contains "$out" '--agent-rewind needs --agents'
 }
 
+run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping

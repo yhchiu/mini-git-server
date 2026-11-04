@@ -18,6 +18,19 @@ sudo make test-integration
 
 GitHub Actions runs them in a separate `integration` job.
 
+## Writing tests
+
+Both test suites run each test with `set -e`: any command that fails stops
+the test and marks it as failed, so a plain check such as
+`[[ -f "$file" ]]` works anywhere in a test.
+
+- To check that a command fails, wrap it:
+  `if out=$(cmd 2>&1); then return 1; fi`, then check `$out`.
+- Do not write `! cmd` as a check. Bash ignores the result of a negated
+  command under `set -e`, so the check can never fail.
+- Do not call a test function as the condition of `if`, `&&` or `||`.
+  Bash turns `set -e` off there, so failing checks inside it are ignored.
+
 ## Upgrade notes
 
 When a change needs manual steps on existing installations (server settings,
