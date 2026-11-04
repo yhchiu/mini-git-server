@@ -18,6 +18,14 @@ sudo make test-integration
 
 GitHub Actions runs them in a separate `integration` job.
 
+## Upgrade notes
+
+When a change needs manual steps on existing installations (server settings,
+the `gitolite-admin` layout, or commands that now behave differently),
+describe them in `docs/upgrade/<next-version>.md` and add a row to the
+"Upgrade notes" table in the README. Keep the README upgrade section limited
+to the general steps that apply to every version.
+
 ## Design constraints
 
 Keep the project small and conservative:

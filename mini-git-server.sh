@@ -734,7 +734,7 @@ server_doctor() {
       | awk '$1 == "acceptenv" && $2 == "GIT_PROTOCOL" {found = 1} END {exit !found}'; then
       check_ok "sshd accepts GIT_PROTOCOL for $git_user (Git protocol v2)"
     else
-      check_warn "sshd does not accept GIT_PROTOCOL for $git_user, so Git uses the slower protocol v0 (see README: Git protocol v2)"
+      check_warn "sshd does not accept GIT_PROTOCOL for $git_user, so Git uses the slower protocol v0 (see README: Many agents at once)"
     fi
   fi
 
@@ -1001,7 +1001,7 @@ and creates conf/groups/ and conf/repos/. Script-managed groups and
 repository ACLs are stored there. Gitolite needs a group to be defined
 before a rule uses it, so the groups include always comes first.
 
-Running it again is safe. On a working tree set up by an older version, it
+Running it again is safe. On a working tree set up before 0.3.0, it
 adds the groups include in front of the existing repos include.
 USAGE
 }

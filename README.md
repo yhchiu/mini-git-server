@@ -9,8 +9,7 @@
 
 It intentionally does **not** add a web forge, database, Redis, container runtime, package registry, or CI system.
 
-Already running a server set up with an earlier copy of the script? See
-[13. Upgrading an existing installation](#13-upgrading-an-existing-installation).
+Upgrading from an earlier version? See [13. Upgrading](#13-upgrading).
 
 ## Design goals
 
@@ -189,9 +188,10 @@ include "repos/*.conf"
 
 and stores script-managed groups under `conf/groups/` and repository ACLs
 under `conf/repos/`. Gitolite needs a group to be defined before a rule uses
-it, so the groups include always comes first. On a working tree set up by an
-older version, run `admin-init` again: it adds the groups include in front
-of the existing repos include.
+it, so the groups include always comes first. Running `admin-init` again is
+safe: on a working tree set up before 0.3.0, it adds the groups include in
+front of the existing repos include (see
+[Upgrading to 0.3.0](docs/upgrade/0.3.0.md)).
 
 Deploy the change after review:
 
@@ -579,8 +579,8 @@ before starting a change avoids this.
 
 ### Repair an admin repository on the wrong branch
 
-Earlier versions of `install --default-branch NAME` created `gitolite-admin`
-on branch `NAME` instead of `master`. On such a server every push to
+Before 0.3.0, `install --default-branch NAME` created `gitolite-admin` on
+branch `NAME` instead of `master`. On such a server every push to
 `gitolite-admin` succeeds, but Gitolite never applies it: new keys and
 repositories do not appear. `doctor` reports this as a failure, and `apply`
 refuses to run on that branch.
@@ -697,9 +697,9 @@ Limits:
 - Git may delete commits that no branch or reflog points to once they are
   two weeks old (`gc.pruneExpire`). Commits in a reflog are kept longer
   (30 days by default). Recover soon, or rely on `backup`.
-- On an older install, enable the reflog with
-  `sudo runuser -u git -- git -C /home/git config --global core.logAllRefUpdates always`.
-  `doctor` reports whether it is enabled.
+- Installs made before 0.3.0 have no reflog until it is enabled by hand
+  (see [Upgrading to 0.3.0](docs/upgrade/0.3.0.md)). `doctor` reports
+  whether it is enabled.
 
 ### Reviewing and merging agent work
 
@@ -814,11 +814,10 @@ lines to admin workstations and agent hosts over a channel you trust.
   account, so Git can use protocol v2. With v2 the server lists only the
   refs a client asks for (for example only `trunk` in `git fetch origin
   trunk`), instead of every branch and tag on every connection. This
-  matters when a repository collects many agent branches. On an
-  older install, add `AcceptEnv GIT_PROTOCOL` inside the `Match User git`
-  block of `/etc/ssh/sshd_config.d/90-gitolite.conf`, then run
-  `sudo sshd -t && sudo systemctl reload ssh`. `doctor` reports whether it is
-  enabled.
+  matters when a repository collects many agent branches. Installs made
+  before 0.3.0 need one manual change for this (see
+  [Upgrading to 0.3.0](docs/upgrade/0.3.0.md)). `doctor` reports whether it
+  is enabled.
 - **Connection bursts.** By default sshd starts dropping new connections
   at random once 10 of them are waiting to log in (`MaxStartups 10:30:100`).
   If many agents fetch at the same moment and some fail with "Connection
@@ -836,7 +835,8 @@ git@...`. If it shows your own name, the agent can use your keys.
 
 ### Moving admin rights to a separate identity
 
-Older examples used the same name for the admin and the daily identity. To
+Examples before 0.3.0 used the same name for the admin and the daily
+identity. To
 move admin rights to `arthur-admin` without locking yourself out:
 
 1. Create the admin key (step 1) and add it:
@@ -916,141 +916,66 @@ The exception is not needed for changing a repository default branch: use `repo-
 
 Do not run CI jobs or arbitrary repository code on the Git server itself. Keep the Git server as the repository/control plane and use separate CI/agent execution hosts.
 
-## 13. Upgrading an existing installation
+## 13. Upgrading
 
-Use these steps on a server that was installed with an earlier copy of
-`mini-git-server.sh`. New installs already have everything below.
+Upgrading replaces the script. It never changes access rules by itself:
+existing keys and repository ACLs keep working, and Gitolite itself is not
+touched. When a new version needs changes on the server or in
+`gitolite-admin`, its upgrade notes list them, and you make them by hand.
 
-Upgrading does not change any access rules by itself. Existing keys and
-repository ACLs keep working, and Gitolite itself is not touched. The script
-has no separate upgrade command: you replace the script, then make a few
-small changes by hand.
+Check which version you have:
 
-The commands below assume the default hosting account `git` with the home
-directory `/home/git`. If you installed with `--git-user`, use that account
-instead (and pass `--git-user` to `doctor` and `backup`).
+```bash
+./mini-git-server.sh version
+```
 
-### On the server
+### Upgrade notes
 
-1. Copy the new `mini-git-server.sh` to the server, replacing the old one.
-2. Run `doctor` and note every `[FAIL]` and `[WARN]` line:
+Read the notes of every version newer than yours, oldest first:
 
-   ```bash
-   sudo ./mini-git-server.sh doctor
-   ```
+| Version | Upgrading from | Notes |
+|---|---|---|
+| 0.3.0 | 0.2.x | [docs/upgrade/0.3.0.md](docs/upgrade/0.3.0.md) |
 
-3. If `doctor` reports `gitolite-admin HEAD is 'refs/heads/...', expected
-   refs/heads/master`, the server was installed with `--default-branch` by
-   an older version, and Gitolite has been ignoring every admin change.
-   Repair this first, following
-   [Repair an admin repository on the wrong branch](#repair-an-admin-repository-on-the-wrong-branch).
-4. Keep a reflog in every hosted repository, so force-pushed commits can be
-   recovered (`doctor`: `hosted repositories keep no reflog`):
+### General steps
+
+1. Read the upgrade notes of the new version, and of every version you skip.
+2. Replace `mini-git-server.sh` on the server and on every admin workstation
+   with the new copy, and check it:
 
    ```bash
-   sudo runuser -u git -- git -C /home/git config --global core.logAllRefUpdates always
+   ./mini-git-server.sh version
    ```
 
-5. Let Git clients use protocol v2 (`doctor`: `sshd does not accept
-   GIT_PROTOCOL`). This adds `AcceptEnv GIT_PROTOCOL` to the
-   `Match User git` block of the drop-in written by earlier versions, checks
-   the SSH configuration, and reloads sshd:
-
-   ```bash
-   sudo grep -qx '    AcceptEnv GIT_PROTOCOL' /etc/ssh/sshd_config.d/90-gitolite.conf \
-     || sudo sed -i '/^    PermitTTY no$/a\    AcceptEnv GIT_PROTOCOL' /etc/ssh/sshd_config.d/90-gitolite.conf
-   ```
-
-   ```bash
-   sudo sshd -t && sudo systemctl reload ssh
-   ```
-
-   The first command only adds the line when it is missing, so it is safe
-   to run again. If you edited that drop-in by hand, add the line inside the
-   `Match User git` block yourself instead.
-6. Run a new backup. When run as root, earlier versions failed for every
-   repository, so their backups most likely contain no usable mirrors:
+3. On the server, make a backup before changing anything else:
 
    ```bash
    sudo ./mini-git-server.sh backup
    ```
 
-7. Print the host keys and add the `known_hosts` lines to admin
-   workstations and agent hosts (see [Server host keys](#server-host-keys)):
+4. On the server, run `doctor` and note every `[FAIL]` and `[WARN]` line:
 
    ```bash
-   sudo ./mini-git-server.sh host-keys --host git.example.internal
+   sudo ./mini-git-server.sh doctor
    ```
 
-8. Run `doctor` again. The admin branch, reflog and `GIT_PROTOCOL` checks
-   should now be `[ OK ]`.
-
-### On each admin workstation
-
-1. Copy the new `mini-git-server.sh`, replacing the old one.
-2. Inside the `gitolite-admin` working tree, get the latest state:
+5. Do the server steps from the upgrade notes.
+6. On each admin workstation, bring the `gitolite-admin` working tree up to
+   date:
 
    ```bash
    /path/to/mini-git-server.sh sync
    ```
 
-Do the next two steps on **one** workstation only. The other workstations
-get the result with `sync`.
+7. Do the workstation steps from the upgrade notes on **one** workstation
+   only, review the staged diff, and `apply` it. The other workstations get
+   the result with `sync`.
+8. Run `doctor` on the server again. No `[FAIL]` line should be left; the
+   upgrade notes explain any `[WARN]` line that may stay.
 
-3. Enable script-managed groups and apply:
-
-   ```bash
-   /path/to/mini-git-server.sh admin-init
-   /path/to/mini-git-server.sh apply -m "Enable script-managed groups"
-   ```
-
-   `admin-init` adds `include "groups/*.conf"` in front of the existing
-   `include "repos/*.conf"`.
-4. Check the existing repository ACLs with the new checks. For each
-   repository under `conf/repos/`, run `repo-show` and then the reapply
-   command it prints:
-
-   ```bash
-   /path/to/mini-git-server.sh repo-show --repo project-x
-   ```
-
-   `repo-set` now refuses an identity with two roles (for example an agent
-   that is also a writer, which could push to every unprotected branch) and
-   warns about identities without a key. If the ACL was already correct,
-   the file does not change and `apply` reports `No staged changes to
-   apply.` Fragments written by much older versions, without the
-   `# mini-git-server:` metadata lines, get those lines added; the access
-   rules stay the same, so review the diff and `apply` it.
-
-### Optional improvements
-
-These change how you work, so do them when convenient:
-
-- Move admin rights from your daily identity to a separate admin identity:
-  [Moving admin rights to a separate identity](#moving-admin-rights-to-a-separate-identity).
-- Put your agents in a group and use `--agents @agents`, so a new agent
-  only needs `group-set`: [Groups](#groups).
-- Let agents rewrite their own branches with `--agent-rewind`:
-  [Letting agents rewrite their own branches](#letting-agents-rewrite-their-own-branches).
-- Add the agent instructions template to your project repositories:
-  [Instructions for the agents](#instructions-for-the-agents).
-
-### What behaves differently after upgrading
-
-- `apply` only runs on the `master` branch of `gitolite-admin`, and stops
-  before committing when another machine has pushed newer changes. Run
-  `sync`, then `apply` again ([Working from several machines](#working-from-several-machines)).
-- `repo-set` refuses an identity with two roles, and agent names that
-  contain characters other than letters, digits, `-` and `_`.
-- `user-add` refuses a name like `arthur@laptop` (Gitolite reads it as
-  `arthur`; use `--key-id laptop`), and a key that is already stored for
-  another identity.
-- `user-remove` refuses to remove the last key that can push to
-  `gitolite-admin`, unless `--force` is given.
-- `backup` works when run as root.
-- `doctor` checks `authorized_keys` correctly when its input is not a
-  terminal (for example from cron or over `ssh`). Before, it could hang or
-  report a pass without checking anything.
+The commands assume the default hosting account `git` with the home
+directory `/home/git`. If you installed with `--git-user`, use that account
+instead, and pass `--git-user` to the server commands.
 
 ## Testing
 
