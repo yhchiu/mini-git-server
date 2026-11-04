@@ -8,6 +8,10 @@ DEFAULT_GIT_USER="git"
 DEFAULT_SSH_PORT="22"
 DEFAULT_SSHD_DROPIN="/etc/ssh/sshd_config.d/90-gitolite.conf"
 DEFAULT_SSHD_PORT_DROPIN="/etc/ssh/sshd_config.d/00-gitolite-port.conf"
+# Named to sort last: in OpenSSH 10 the last MaxStartups setting wins, unlike
+# most options, where the first one wins. ssh-limits checks the effective
+# value after writing it, so either order is detected.
+DEFAULT_SSHD_LIMITS_DROPIN="/etc/ssh/sshd_config.d/99-gitolite-limits.conf"
 # Gitolite 3.6.12 (the Debian 13 package) only compiles pushes to this branch
 # of gitolite-admin. Newer upstream releases follow the admin repository HEAD,
 # which also works as long as HEAD points here.
@@ -33,6 +37,7 @@ Server commands (run on the Git server):
   fsck            Run git fsck on hosted repositories
   repo-set-default Set a repository HEAD/default branch
   host-keys       Print SSH host key fingerprints and known_hosts lines
+  ssh-limits      Show or set how many SSH logins sshd accepts at once
 
 Admin-workstation commands (run inside or against a gitolite-admin clone):
   admin-clone     Clone gitolite-admin from the server
@@ -312,6 +317,79 @@ validate_pubkey() {
   esac
 }
 
+# MaxStartups is START, or START:RATE:FULL (see sshd_config(5)).
+validate_max_startups() {
+  local value=$1 start rate full
+  if [[ $value =~ ^([0-9]+)$ ]]; then
+    start=${BASH_REMATCH[1]} rate=30 full=$start
+  elif [[ $value =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+    start=${BASH_REMATCH[1]} rate=${BASH_REMATCH[2]} full=${BASH_REMATCH[3]}
+  else
+    die "Invalid MaxStartups value: $value (use START or START:RATE:FULL, for example 50:30:200)"
+  fi
+  (( 10#$start >= 1 && 10#$rate >= 1 && 10#$rate <= 100 && 10#$start <= 10#$full )) || \
+    die "Invalid MaxStartups value: $value (START must be at least 1 and at most FULL, and RATE between 1 and 100)"
+}
+
+# Print the MaxStartups value as sshd -T reports it ("20" becomes "20:30:20").
+normalize_max_startups() {
+  local value=$1
+  [[ $value == *:* ]] || value="$value:30:$value"
+  printf '%s\n' "$value"
+}
+
+effective_max_startups() {
+  sshd -T 2>/dev/null | awk '$1 == "maxstartups" {print $2; exit}'
+}
+
+# Reload sshd when systemd runs it. Without systemd (for example in a
+# container), systemctl cannot reload it, so only warn.
+reload_sshd() {
+  if [[ -d /run/systemd/system ]]; then
+    systemctl reload ssh || systemctl restart ssh
+  else
+    warn "systemd is not running, so sshd was not reloaded. Start or reload sshd yourself to use the new SSH settings."
+  fi
+}
+
+# Write MaxStartups to the managed drop-in. Restore the previous file when
+# sshd rejects the result, or when another setting makes the value not apply.
+write_max_startups_dropin() {
+  local value=$1 previous="" effective expected
+  expected=$(normalize_max_startups "$value")
+  install -d -m 0755 /etc/ssh/sshd_config.d
+  if [[ -f $DEFAULT_SSHD_LIMITS_DROPIN ]]; then
+    previous=$(mktemp)
+    cp -a "$DEFAULT_SSHD_LIMITS_DROPIN" "$previous"
+  fi
+  {
+    printf '# Managed by mini-git-server.sh (ssh-limits)\n'
+    printf '# Unauthenticated connections sshd accepts at once: START:RATE:FULL.\n'
+    printf 'MaxStartups %s\n' "$value"
+  } >"$DEFAULT_SSHD_LIMITS_DROPIN"
+  chmod 0644 "$DEFAULT_SSHD_LIMITS_DROPIN"
+
+  local problem=""
+  if ! sshd -t; then
+    problem="sshd rejected 'MaxStartups $value'"
+  else
+    effective=$(effective_max_startups)
+    if [[ $effective != "$expected" ]]; then
+      problem="sshd uses MaxStartups ${effective:-unknown}, not $expected: another MaxStartups line in the sshd configuration (for example in /etc/ssh/sshd_config after its Include line) overrides $DEFAULT_SSHD_LIMITS_DROPIN"
+    fi
+  fi
+  if [[ -n $problem ]]; then
+    if [[ -n $previous ]]; then
+      cp -a "$previous" "$DEFAULT_SSHD_LIMITS_DROPIN"
+      rm -f "$previous"
+    else
+      rm -f "$DEFAULT_SSHD_LIMITS_DROPIN"
+    fi
+    die "$problem. The previous setting was restored."
+  fi
+  [[ -z $previous ]] || rm -f "$previous"
+}
+
 server_install_usage() {
   cat <<'USAGE'
 Usage:
@@ -325,6 +403,8 @@ Options:
   --git-user USER        Hosting Unix account (default: git)
   --ssh-port PORT        Configure sshd listening port (default: 22)
   --default-branch NAME  Set Git init.defaultBranch for newly created repositories
+  --max-startups VALUE   Set sshd MaxStartups (default: sshd's 10:30:100).
+                         See 'ssh-limits --help'.
   --no-ssh-hardening     Do not install the Match User SSH hardening drop-in
   -h, --help
 
@@ -430,7 +510,7 @@ EOF_HARDEN
 server_install() {
   require_root
   local admin_key="" admin_name="admin" git_user=$DEFAULT_GIT_USER ssh_port=$DEFAULT_SSH_PORT
-  local default_branch="" harden=1
+  local default_branch="" harden=1 max_startups=""
 
   while (($#)); do
     case "$1" in
@@ -439,6 +519,7 @@ server_install() {
       --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
       --ssh-port) [[ $# -ge 2 ]] || die "--ssh-port requires a value"; ssh_port=$2; shift 2 ;;
       --default-branch) [[ $# -ge 2 ]] || die "--default-branch requires a value"; default_branch=$2; shift 2 ;;
+      --max-startups) [[ $# -ge 2 ]] || die "--max-startups requires a value"; max_startups=$2; shift 2 ;;
       --no-ssh-hardening) harden=0; shift ;;
       -h|--help) server_install_usage; return 0 ;;
       *) die "Unknown install option: $1" ;;
@@ -450,6 +531,7 @@ server_install() {
   validate_simple_name "$admin_name" "Admin name"
   validate_unix_user "$git_user"
   validate_port "$ssh_port"
+  [[ -z $max_startups ]] || validate_max_startups "$max_startups"
 
   [[ -r /etc/os-release ]] || die "Cannot identify operating system"
   # shellcheck disable=SC1091
@@ -509,6 +591,7 @@ EOF_PORT
     warn "sshd has multiple configured ports ($effective_ports). Another active Port directive exists outside $DEFAULT_SSHD_PORT_DROPIN."
   fi
   [[ -z $previous_port_dropin ]] || rm -f "$previous_port_dropin"
+  [[ -z $max_startups ]] || write_max_startups_dropin "$max_startups"
 
   init_hosting_account "$git_user" "$admin_key" "$admin_name" "$default_branch"
   local git_home
@@ -528,13 +611,7 @@ EOF_PORT
     fi
   fi
 
-  # /run/systemd/system exists only when systemd is the running init system.
-  # Without it (for example in a container), systemctl cannot reload sshd.
-  if [[ -d /run/systemd/system ]]; then
-    systemctl reload ssh || systemctl restart ssh
-  else
-    warn "systemd is not running, so sshd was not reloaded. Start or reload sshd yourself to use the new SSH settings."
-  fi
+  reload_sshd
   log "Installation complete."
   cat <<EOF_RESULT
 
@@ -614,6 +691,59 @@ server_host_keys() {
   done
 }
 
+server_ssh_limits_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh ssh-limits                         Show the current value
+  mini-git-server.sh ssh-limits --max-startups VALUE    Set it
+  mini-git-server.sh ssh-limits --reset                 Go back to sshd's default
+
+MaxStartups limits how many SSH connections may be waiting to log in at the
+same time. VALUE is START:RATE:FULL: once START connections are waiting,
+sshd drops new ones at random (RATE percent), and at FULL it drops all of
+them. The sshd default is 10:30:100. When many agents connect at the same
+moment and some fail with "Connection closed", raise it, for example to
+50:30:200.
+
+The value is written to /etc/ssh/sshd_config.d/99-gitolite-limits.conf and
+checked with sshd before sshd is reloaded. If sshd rejects it, or another
+MaxStartups line overrides it, the previous setting is restored.
+USAGE
+}
+
+server_ssh_limits() {
+  local value="" reset=0
+  while (($#)); do
+    case "$1" in
+      --max-startups) [[ $# -ge 2 ]] || die "--max-startups requires a value"; value=$2; shift 2 ;;
+      --reset) reset=1; shift ;;
+      -h|--help) server_ssh_limits_usage; return 0 ;;
+      *) die "Unknown ssh-limits option: $1" ;;
+    esac
+  done
+  [[ -z $value || $reset -eq 0 ]] || die "Use either --max-startups or --reset, not both"
+  require_root
+  need_cmd sshd
+
+  if [[ -n $value ]]; then
+    validate_max_startups "$value"
+    write_max_startups_dropin "$value"
+    reload_sshd
+    log "MaxStartups is now $(effective_max_startups)."
+  elif (( reset )); then
+    if [[ -f $DEFAULT_SSHD_LIMITS_DROPIN ]]; then
+      rm -f "$DEFAULT_SSHD_LIMITS_DROPIN"
+      sshd -t || die "sshd configuration is invalid after removing $DEFAULT_SSHD_LIMITS_DROPIN"
+      reload_sshd
+    fi
+    log "MaxStartups is now $(effective_max_startups) (no managed setting)."
+  else
+    local source="sshd default or other configuration"
+    [[ -f $DEFAULT_SSHD_LIMITS_DROPIN ]] && source=$DEFAULT_SSHD_LIMITS_DROPIN
+    printf 'MaxStartups: %s (%s)\n' "$(effective_max_startups)" "$source"
+  fi
+}
+
 server_status_usage() {
   cat <<'USAGE'
 Usage:
@@ -656,6 +786,13 @@ server_status() {
     value=${value:-unknown}
   fi
   printf '%-20s %s\n' "SSH ports:" "$value"
+
+  value=$needs_root
+  if (( root )); then
+    value=$(effective_max_startups) || true
+    value=${value:-unknown}
+  fi
+  printf '%-20s %s\n' "SSH MaxStartups:" "$value"
 
   value=$needs_root
   if (( root )); then
@@ -911,6 +1048,9 @@ server_backup() {
   fi
   if [[ -f $DEFAULT_SSHD_DROPIN ]]; then
     cp -a "$DEFAULT_SSHD_DROPIN" "$backup_dir/meta/"
+  fi
+  if [[ -f $DEFAULT_SSHD_LIMITS_DROPIN ]]; then
+    cp -a "$DEFAULT_SSHD_LIMITS_DROPIN" "$backup_dir/meta/"
   fi
   {
     printf 'created=%s\n' "$(date --iso-8601=seconds)"
@@ -2082,6 +2222,7 @@ main() {
     fsck)         server_fsck "$@" ;;
     repo-set-default) server_repo_set_default "$@" ;;
     host-keys)    server_host_keys "$@" ;;
+    ssh-limits)   server_ssh_limits "$@" ;;
     admin-clone)  admin_clone "$@" ;;
     admin-init)   admin_init "$@" ;;
     user-add)     user_add "$@" ;;

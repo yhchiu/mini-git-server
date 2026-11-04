@@ -26,6 +26,7 @@ GL_USER=git
 GL_HOME=/home/git
 PORT_DROPIN=/etc/ssh/sshd_config.d/00-gitolite-port.conf
 HARDENING_DROPIN=/etc/ssh/sshd_config.d/90-gitolite.conf
+LIMITS_DROPIN=/etc/ssh/sshd_config.d/99-gitolite-limits.conf
 
 refuse() {
   printf '%s\n' "$*" >&2
@@ -38,7 +39,7 @@ refuse() {
 # shellcheck disable=SC1091
 [[ $(. /etc/os-release && printf '%s' "${ID:-}") == debian ]] || \
   refuse "The install test needs Debian, because install supports Debian only."
-if id "$GL_USER" >/dev/null 2>&1 || [[ -e $PORT_DROPIN || -e $HARDENING_DROPIN ]]; then
+if id "$GL_USER" >/dev/null 2>&1 || [[ -e $PORT_DROPIN || -e $HARDENING_DROPIN || -e $LIMITS_DROPIN ]]; then
   refuse "This system already has a '$GL_USER' account or mini-git-server SSH settings. Use a fresh system."
 fi
 
@@ -163,7 +164,8 @@ expect_push() {
 }
 
 config_checksums() {
-  sha256sum "$PORT_DROPIN" "$HARDENING_DROPIN" "$GL_HOME/.ssh/authorized_keys" "$GL_HOME/.gitconfig"
+  sha256sum "$PORT_DROPIN" "$HARDENING_DROPIN" "$LIMITS_DROPIN" \
+    "$GL_HOME/.ssh/authorized_keys" "$GL_HOME/.gitconfig"
 }
 
 # ---------------------------------------------------------------------------
@@ -174,7 +176,8 @@ test_install() {
     --admin-key "$KEYS/admin.pub" \
     --admin-name arthur-admin \
     --ssh-port "$SSH_PORT" \
-    --default-branch trunk 2>&1)
+    --default-branch trunk \
+    --max-startups 50:30:200 2>&1)
   printf '%s\n' "$out"
   assert_contains "$out" 'Installation complete.'
   assert_contains "$out" "]:$SSH_PORT ssh-ed25519 " 'install must print known_hosts lines'
@@ -186,6 +189,7 @@ test_install() {
   # "sshd -T | grep -q" can fail when grep stops reading early.
   all=$(sshd -T)
   grep -qx "port $SSH_PORT" <<<"$all"
+  grep -qx 'maxstartups 50:30:200' <<<"$all"
   effective=$(sshd -T -C "user=$GL_USER,host=localhost,addr=127.0.0.1")
   grep -qx 'acceptenv GIT_PROTOCOL' <<<"$effective"
   grep -qx 'permittty no' <<<"$effective"
@@ -208,7 +212,8 @@ test_second_install_changes_nothing() {
     --admin-key "$KEYS/other.pub" \
     --admin-name someone-else \
     --ssh-port 2200 \
-    --default-branch other 2>&1); then
+    --default-branch other \
+    --max-startups 5 2>&1); then
     printf '  a second install did not fail\n'
     return 1
   fi
@@ -291,11 +296,47 @@ test_doctor_status_backup() {
   printf '%s\n' "$out"
   grep -Eq "^SSH ports: +$SSH_PORT\$" <<<"$out"
   grep -Eq '^Default branch: +trunk$' <<<"$out"
+  grep -Eq '^SSH MaxStartups: +50:30:200$' <<<"$out"
 
   out=$("$SCRIPT" backup --output "$TMP/backups")
   backup_dir=$(printf '%s\n' "$out" | tail -n 1)
   grep -qx 'failed=0' "$backup_dir/meta/manifest.txt"
+  grep -Eq '^gitolite_version=3\.' "$backup_dir/meta/manifest.txt"
   [[ -d "$backup_dir/repos/project-e2e.git" && -d "$backup_dir/repos/gitolite-admin.git" ]]
+  [[ -f "$backup_dir/meta/$(basename "$LIMITS_DROPIN")" ]]
+}
+
+test_ssh_limits() {
+  local out before
+  out=$("$SCRIPT" ssh-limits)
+  assert_eq "MaxStartups: 50:30:200 ($LIMITS_DROPIN)" "$out"
+
+  "$SCRIPT" ssh-limits --max-startups 20
+  assert_eq '20:30:20' "$(sshd -T | awk '$1 == "maxstartups" {print $2}')"
+
+  # sshd would reject this value; nothing may change.
+  before=$(sha256sum "$LIMITS_DROPIN")
+  if "$SCRIPT" ssh-limits --max-startups 100:30:10; then
+    printf '  an invalid value was accepted\n'
+    return 1
+  fi
+  assert_eq "$before" "$(sha256sum "$LIMITS_DROPIN")"
+
+  # A MaxStartups line after the Include line of sshd_config overrides the
+  # drop-in. ssh-limits must notice it and restore the previous file.
+  printf 'MaxStartups 9:30:90 # mini-git-server test\n' >>/etc/ssh/sshd_config
+  if out=$("$SCRIPT" ssh-limits --max-startups 50:30:200 2>&1); then
+    printf '  an overridden value was accepted\n'
+    return 1
+  fi
+  printf '%s\n' "$out"
+  assert_contains "$out" 'overrides'
+  assert_eq "$before" "$(sha256sum "$LIMITS_DROPIN")" 'the previous drop-in must be restored'
+  sed -i '/# mini-git-server test$/d' /etc/ssh/sshd_config
+
+  "$SCRIPT" ssh-limits --reset
+  [[ ! -e $LIMITS_DROPIN ]]
+  assert_eq '10:30:100' "$(sshd -T | awk '$1 == "maxstartups" {print $2}')"
 }
 
 # ---------------------------------------------------------------------------
@@ -320,5 +361,6 @@ step 'a second install is refused and changes nothing' test_second_install_chang
 step 'real SSH works with the printed host keys, using Git protocol v2' test_real_ssh_and_protocol_v2
 step 'the admin workflow and access rules work over SSH' test_admin_workflow_over_ssh
 step 'doctor, status and backup report the installed server correctly' test_doctor_status_backup
+step 'ssh-limits sets, checks and resets MaxStartups' test_ssh_limits
 
 printf '\n%d passed, 0 failed\n' "$PASS"

@@ -1070,6 +1070,7 @@ test_status_marks_fields_that_need_root() {
   out=$(status_with_mocks 0 "$home")
   assert_contains "$out" "Not running as root"
   assert_contains "$out" 'SSH ports:           (needs root)'
+  assert_contains "$out" 'SSH MaxStartups:     (needs root)'
   assert_contains "$out" 'Default branch:      (needs root)'
   assert_contains "$out" 'Password status:     (needs root)'
   assert_not_contains "$out" 'Git-default'
@@ -1090,9 +1091,38 @@ test_status_prints_one_line_per_field() {
   mkdir -p "$home"
   out=$(status_with_mocks 1 "$home")
   # A failing command must not leave its output in front of the fallback.
-  assert_contains "$out" $'SSH service:         inactive\nSSH ports:           unknown\nDefault branch:      Git-default\n'
+  assert_contains "$out" $'SSH service:         inactive\nSSH ports:           unknown\nSSH MaxStartups:     unknown\nDefault branch:      Git-default\n'
   assert_contains "$out" 'Gitolite:            unknown'
   assert_contains "$out" 'Repository count:    0'
+}
+
+test_validate_max_startups() {
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  local value
+  for value in 10 10:30:100 50:30:200 20:100:20 1:1:1; do
+    ( validate_max_startups "$value" ) >/dev/null 2>&1 || {
+      printf '  rejected valid value %s\n' "$value"
+      return 1
+    }
+  done
+  # The same values that sshd itself rejects.
+  for value in 0 abc 10:30 100:30:10 10:101:100 10:0:100 -5 '10:30:100 '; do
+    if ( validate_max_startups "$value" ) >/dev/null 2>&1; then
+      printf '  accepted invalid value %q\n' "$value"
+      return 1
+    fi
+  done
+  assert_eq '20:30:20' "$(normalize_max_startups 20)"
+  assert_eq '50:30:200' "$(normalize_max_startups 50:30:200)"
+}
+
+test_ssh_limits_rejects_both_options() {
+  local out
+  if out=$("$SCRIPT" ssh-limits --max-startups 50:30:200 --reset 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'either --max-startups or --reset'
 }
 
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
@@ -1101,6 +1131,8 @@ run_test 'version reports 0.3.0' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
 run_test 'repository fragment names encode slashes' test_repo_fragment_name
 run_test 'SSH port validation accepts only 1..65535' test_validate_port
+run_test 'MaxStartups validation matches what sshd accepts' test_validate_max_startups
+run_test 'ssh-limits refuses --max-startups together with --reset' test_ssh_limits_rejects_both_options
 run_test 'admin-init is idempotent' test_admin_init_idempotent
 run_test 'repo-set generates least-privilege agent ACL without hardcoded main' test_repo_set_acl_and_no_hardcoded_main
 run_test 'protected branches are exact and escaped' test_protected_branch_exact_and_escaped

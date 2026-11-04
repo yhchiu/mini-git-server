@@ -36,6 +36,7 @@ backup
 fsck
 repo-set-default
 host-keys
+ssh-limits
 ```
 
 Admin-workstation commands:
@@ -834,8 +835,18 @@ lines to admin workstations and agent hosts over a channel you trust.
 - **Connection bursts.** By default sshd starts dropping new connections
   at random once 10 of them are waiting to log in (`MaxStartups 10:30:100`).
   If many agents fetch at the same moment and some fail with "Connection
-  closed", raise it, for example `MaxStartups 50:30:200`, in a drop-in
-  outside any `Match` block.
+  closed", raise the limit:
+
+  ```bash
+  sudo ./mini-git-server.sh ssh-limits --max-startups 50:30:200
+  ```
+
+  `ssh-limits` writes `/etc/ssh/sshd_config.d/99-gitolite-limits.conf`,
+  checks it with sshd, and reloads sshd. If sshd rejects the value, or
+  another `MaxStartups` line overrides it, the previous setting is
+  restored. Run `ssh-limits` without options to see the current value, and
+  `ssh-limits --reset` to go back to sshd's default. `install` accepts the
+  same value with `--max-startups`, and `status` shows the effective value.
 
 An agent can check which identity it really has:
 
