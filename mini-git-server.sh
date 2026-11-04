@@ -171,24 +171,48 @@ identity_key_files() {
   done < <(find "$dir/keydir" -type f -name '*.pub' -print0 | sort -z)
 }
 
-# Print the users that may push to gitolite-admin, read from the
-# gitolite-admin block of conf/gitolite.conf. Group names (@...) are skipped.
+# Print the users that may push to gitolite-admin. The rules are read from
+# the gitolite-admin block, and @groups in those rules are replaced by their
+# members, using the group definitions in every conf file (including groups
+# managed by group-set, and groups inside groups). @all is skipped, because
+# it cannot be listed.
 admin_identities() {
   local dir=$1
+  local -a files=("$dir/conf/gitolite.conf")
+  mapfile -t -O 1 files < <(find "$dir/conf" -type f -name '*.conf' ! -path "$dir/conf/gitolite.conf" | sort)
   awk '
-    /^[[:space:]]*repo[[:space:]]/ {
-      in_admin = 0
-      for (i = 2; i <= NF; i++) if ($i == "gitolite-admin") in_admin = 1
+    function add(name,    i, n, list) {
+      if (name == "@all") return
+      if (name !~ /^@/) {
+        if (!seen[name]++) print name
+        return
+      }
+      if (expanded[name]++) return
+      n = split(members[name], list, " ")
+      for (i = 1; i <= n; i++) add(list[i])
+    }
+    FNR == 1 { in_admin = 0 }
+    { line = $0; sub(/#.*/, "", line) }
+    line ~ /^[[:space:]]*@[^[:space:]=]+[[:space:]]*=/ {
+      split(line, parts, "=")
+      name = parts[1]
+      gsub(/[[:space:]]/, "", name)
+      members[name] = members[name] " " parts[2]
       next
     }
-    in_admin && /^[[:space:]]*RW/ && index($0, "=") {
-      sub(/#.*/, "")
-      split($0, parts, "=")
-      n = split(parts[2], users, " ")
-      for (i = 1; i <= n; i++)
-        if (users[i] !~ /^@/ && !seen[users[i]]++) print users[i]
+    line ~ /^[[:space:]]*repo[[:space:]]/ {
+      n = split(line, words, " ")
+      in_admin = 0
+      for (i = 2; i <= n; i++) if (words[i] == "gitolite-admin") in_admin = 1
+      next
     }
-  ' "$dir/conf/gitolite.conf"
+    in_admin && line ~ /^[[:space:]]*RW/ && index(line, "=") {
+      split(line, parts, "=")
+      n = split(parts[2], users, " ")
+      for (i = 1; i <= n; i++) rule_users[++count] = users[i]
+    }
+    END { for (i = 1; i <= count; i++) add(rule_users[i]) }
+  ' "${files[@]}"
 }
 
 # Succeed if NAME is one of the words in the space-separated LIST.
@@ -1190,7 +1214,7 @@ user_remove() {
   local admins admin file remaining=0
   admins=$(admin_identities "$dir")
   if [[ -z $admins ]]; then
-    warn "No user with write access to gitolite-admin found in conf/gitolite.conf; skipping the lockout check."
+    warn "No user with write access to gitolite-admin was found in the gitolite-admin rules (for example only @all); skipping the lockout check."
   else
     while IFS= read -r admin; do
       while IFS= read -r file; do

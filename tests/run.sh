@@ -979,6 +979,65 @@ test_repo_set_reserves_tags_for_owner_and_agent_branches_for_agents() {
   assert_not_contains "$content" '    -       '
 }
 
+test_admin_identities_expands_groups() {
+  local tmp repo
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  # A group defined in gitolite.conf, with a nested group and a loop.
+  cat >"$repo/conf/gitolite.conf" <<'CONF'
+@ops     = carol @admins
+@admins  = arthur-admin backup-admin @ops
+
+repo gitolite-admin
+    RW+     =   @admins @all
+
+repo testing
+    RW+     =   @all
+CONF
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  assert_eq $'arthur-admin\nbackup-admin\ncarol' "$(admin_identities "$repo")"
+
+  # A group managed by group-set, in conf/groups/.
+  cat >"$repo/conf/gitolite.conf" <<'CONF'
+include "groups/*.conf"
+
+repo gitolite-admin
+    RW+     =   @keepers
+CONF
+  mkdir -p "$repo/conf/groups"
+  printf '@keepers = dana\n' >"$repo/conf/groups/keepers.conf"
+  assert_eq 'dana' "$(admin_identities "$repo")"
+}
+
+test_user_remove_lockout_check_uses_admin_groups() {
+  local tmp repo out
+  tmp=$(new_tmp)
+  repo="$tmp/admin"
+  new_admin_repo "$repo"
+  cat >"$repo/conf/gitolite.conf" <<'CONF'
+@admins = arthur-admin backup-admin
+
+repo gitolite-admin
+    RW+     =   @admins
+CONF
+  write_key "$repo/keydir/arthur-admin.pub" ArthurAdminKey
+  write_key "$repo/keydir/backup-admin.pub" BackupAdminKey
+  git -C "$repo" add . && git -C "$repo" commit -qm 'admins via a group'
+
+  # backup-admin still has a key, so removing arthur-admin is fine.
+  "$SCRIPT" user-remove --admin-dir "$repo" --name arthur-admin >/dev/null 2>&1
+  [[ ! -e "$repo/keydir/arthur-admin.pub" ]]
+
+  # Now backup-admin has the last admin key.
+  if out=$("$SCRIPT" user-remove --admin-dir "$repo" --name backup-admin 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'last key that can push to gitolite-admin'
+  assert_not_contains "$out" 'skipping the lockout check'
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -1003,6 +1062,8 @@ run_test 'repo-set-default --require-existing rejects a missing branch' test_rep
 run_test 'repo-set-default keeps gitolite-admin on master' test_repo_set_default_keeps_admin_repo_on_master
 run_test 'keydir file names map to users like Gitolite does' test_gitolite_user_for_keyfile_matches_gitolite
 run_test 'admin identities are read from the gitolite-admin block' test_admin_identities_reads_gitolite_admin_block
+run_test 'admin identities expand groups, nested groups and group-set groups' test_admin_identities_expands_groups
+run_test 'user-remove lockout check works when admins are given as a group' test_user_remove_lockout_check_uses_admin_groups
 run_test 'user-add warns when adding a key to an admin identity' test_user_add_warns_for_admin_identity
 run_test 'repo-set warns when an admin identity is used in an ACL' test_repo_set_warns_when_admin_identity_is_used
 run_test 'user-add rejects names that Gitolite would map to another user' test_user_add_rejects_names_gitolite_would_rename
