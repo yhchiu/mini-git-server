@@ -299,11 +299,28 @@ Notes:
 USAGE
 }
 
+# Stop if Gitolite is already set up for GIT_USER. install calls this before
+# it changes anything, so a refused second run leaves the server unchanged.
+refuse_if_initialized() {
+  local git_user=$1 git_home="/home/$1"
+  if id "$git_user" >/dev/null 2>&1; then
+    git_home=$(getent passwd "$git_user" | cut -d: -f6)
+    [[ -n $git_home ]] || die "Cannot determine home directory for user: $git_user"
+  fi
+  if [[ -e "$git_home/.gitolite" || -e "$git_home/repositories/gitolite-admin.git" ]]; then
+    die "Gitolite already appears initialized for $git_user at $git_home; refusing to overwrite it."
+  fi
+  if [[ -s "$git_home/.ssh/authorized_keys" ]]; then
+    die "$git_home/.ssh/authorized_keys is not empty. Use a fresh hosting account or migrate carefully."
+  fi
+}
+
 # Create the hosting account if needed, then initialize Gitolite for it.
 # Arguments: GIT_USER ADMIN_KEY ADMIN_NAME DEFAULT_BRANCH (may be empty).
 init_hosting_account() {
   local git_user=$1 admin_key=$2 admin_name=$3 default_branch=$4
   local git_home
+  refuse_if_initialized "$git_user"
   if id "$git_user" >/dev/null 2>&1; then
     git_home=$(getent passwd "$git_user" | cut -d: -f6)
     [[ -n $git_home ]] || die "Cannot determine home directory for user: $git_user"
@@ -315,14 +332,6 @@ init_hosting_account() {
 
   passwd -l "$git_user" >/dev/null 2>&1 || true
   install -d -m 0700 -o "$git_user" -g "$git_user" "$git_home/.ssh"
-
-  if [[ -e "$git_home/.gitolite" || -e "$git_home/repositories/gitolite-admin.git" ]]; then
-    die "Gitolite already appears initialized for $git_user at $git_home; refusing to overwrite it."
-  fi
-
-  if [[ -s "$git_home/.ssh/authorized_keys" ]]; then
-    die "$git_home/.ssh/authorized_keys is not empty. Use a fresh hosting account or migrate carefully."
-  fi
 
   local temp_key="$git_home/${admin_name}.pub"
   install -m 0600 -o "$git_user" -g "$git_user" "$admin_key" "$temp_key"
@@ -413,6 +422,8 @@ server_install() {
   if [[ ${VERSION_ID:-} != "13" ]]; then
     warn "Designed for Debian 13; detected Debian ${VERSION_ID:-unknown}. Continuing with distro packages."
   fi
+  # Check before installing packages or touching the SSH configuration.
+  refuse_if_initialized "$git_user"
 
   export DEBIAN_FRONTEND=noninteractive
   log "Installing Debian packages: openssh-server git gitolite3 ca-certificates"
@@ -481,7 +492,13 @@ EOF_PORT
     fi
   fi
 
-  systemctl reload ssh || systemctl restart ssh
+  # /run/systemd/system exists only when systemd is the running init system.
+  # Without it (for example in a container), systemctl cannot reload sshd.
+  if [[ -d /run/systemd/system ]]; then
+    systemctl reload ssh || systemctl restart ssh
+  else
+    warn "systemd is not running, so sshd was not reloaded. Start or reload sshd yourself to use the new SSH settings."
+  fi
   log "Installation complete."
   cat <<EOF_RESULT
 
