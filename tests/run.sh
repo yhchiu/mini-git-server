@@ -110,7 +110,7 @@ test_bash_syntax() {
 test_version() {
   local out
   out=$("$SCRIPT" version)
-  assert_contains "$out" "0.2.6"
+  assert_contains "$out" "0.3.0"
 }
 
 test_branch_refex_exact_escaping() {
@@ -923,7 +923,7 @@ test_repo_set_agent_rewind_and_repo_show_round_trip() {
 }
 
 run_test 'bash syntax' test_bash_syntax
-run_test 'version reports 0.2.6' test_version
+run_test 'version reports 0.3.0' test_version
 run_test 'protected branch refex escapes regex characters' test_branch_refex_exact_escaping
 run_test 'repository fragment names encode slashes' test_repo_fragment_name
 run_test 'SSH port validation accepts only 1..65535' test_validate_port

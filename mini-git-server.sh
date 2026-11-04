@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROGRAM=${0##*/}
-VERSION="0.2.6"
+VERSION="0.3.0"
 DEFAULT_GIT_USER="git"
 DEFAULT_SSH_PORT="22"
 DEFAULT_SSHD_DROPIN="/etc/ssh/sshd_config.d/90-gitolite.conf"
