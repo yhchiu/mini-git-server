@@ -55,6 +55,9 @@ Admin-workstation commands (run inside or against a gitolite-admin clone):
   sync            Update gitolite-admin from origin, keeping staged changes
   apply           Review, commit and push gitolite-admin changes
 
+Project commands (run inside a clone of a project repository):
+  agent-branches  List agent branches and how far they are from the base branch
+
 Other:
   version         Show script version
   help            Show this help
@@ -2211,6 +2214,110 @@ admin_apply() {
   fi
 }
 
+agent_branches_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh agent-branches [options]
+
+Run inside a clone of a project repository. Fetches the remote, then lists
+every agent branch (agent/<name>/*) with how many commits it is ahead of and
+behind the base branch, when it was last updated, and its newest commit.
+
+Options:
+  --remote NAME   Remote to read (default: origin)
+  --base BRANCH   Branch to compare with (default: the remote's default
+                  branch, that is its HEAD)
+  --merged        List only branches that have no commits missing from the
+                  base branch, and print the commands that delete them
+  --no-fetch      Use the remote-tracking branches as they are
+  -h, --help
+
+Branches merged with squash or rebase still show commits ahead, because
+their own commits are not in the base branch.
+USAGE
+}
+
+agent_branches() {
+  local remote=origin base="" merged=0 fetch=1
+  while (($#)); do
+    case "$1" in
+      --remote) [[ $# -ge 2 ]] || die "--remote requires a value"; remote=$2; shift 2 ;;
+      --base) [[ $# -ge 2 ]] || die "--base requires a value"; base=$2; shift 2 ;;
+      --merged) merged=1; shift ;;
+      --no-fetch) fetch=0; shift ;;
+      -h|--help) agent_branches_usage; return 0 ;;
+      *) die "Unknown agent-branches option: $1" ;;
+    esac
+  done
+  [[ $remote =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid remote name: $remote"
+  [[ -z $base ]] || validate_branch_name "$base"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+    die "Run agent-branches inside a clone of a project repository."
+  git remote get-url "$remote" >/dev/null 2>&1 || die "No remote named '$remote' in this repository."
+
+  if (( fetch )); then
+    git fetch --quiet --prune "$remote" || die "Could not fetch from '$remote'."
+  fi
+
+  # Do not assume a branch name: use the remote's HEAD unless --base is given.
+  if [[ -z $base ]]; then
+    base=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) || true
+    if [[ -z $base ]] && (( fetch )); then
+      git remote set-head "$remote" --auto >/dev/null 2>&1 || true
+      base=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) || true
+    fi
+    [[ -n $base ]] || die "Cannot tell the default branch of '$remote'. Pass --base BRANCH."
+    base=${base#"$remote/"}
+  fi
+  local base_ref="refs/remotes/$remote/$base"
+  git rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null || \
+    die "Branch '$base' was not found on '$remote' ($base_ref)."
+
+  local ref updated subject counts behind ahead short agent
+  local -a rows=()
+  local agent_width=5 branch_width=6
+  while IFS=$'\t' read -r ref updated subject; do
+    [[ -n $ref ]] || continue
+    counts=$(git rev-list --left-right --count "$base_ref...$ref")
+    behind=${counts%%[[:space:]]*}
+    ahead=${counts##*[[:space:]]}
+    (( merged && ahead > 0 )) && continue
+    short=${ref#"refs/remotes/$remote/"}
+    agent=${short#agent/}
+    agent=${agent%%/*}
+    (( ${#agent} > agent_width )) && agent_width=${#agent}
+    (( ${#short} > branch_width )) && branch_width=${#short}
+    rows+=("$agent"$'\t'"$short"$'\t'"$ahead"$'\t'"$behind"$'\t'"$updated"$'\t'"$subject")
+  done < <(git for-each-ref --sort=-committerdate \
+    --format='%(refname)%09%(committerdate:relative)%09%(subject)' "refs/remotes/$remote/agent/")
+
+  if (( ${#rows[@]} == 0 )); then
+    if (( merged )); then
+      log "No merged agent branches on '$remote' (base: $base)."
+    else
+      log "No agent branches on '$remote'."
+    fi
+    return 0
+  fi
+
+  local row
+  printf "%-${agent_width}s  %-${branch_width}s  %5s  %6s  %-16s  %s\n" AGENT BRANCH AHEAD BEHIND UPDATED SUBJECT
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r agent short ahead behind updated subject <<<"$row"
+    printf "%-${agent_width}s  %-${branch_width}s  %5s  %6s  %-16s  %s\n" \
+      "$agent" "$short" "$ahead" "$behind" "$updated" "$subject"
+  done
+  printf '\nAhead and behind are counted against %s/%s.\n' "$remote" "$base"
+
+  if (( merged )); then
+    printf '\nAll their commits are in %s. The owner can delete them with:\n' "$base"
+    for row in "${rows[@]}"; do
+      IFS=$'\t' read -r agent short _ <<<"$row"
+      printf '  git push %s --delete %s\n' "$remote" "$short"
+    done
+  fi
+}
+
 main() {
   local command_name=${1:-help}
   [[ $# -eq 0 ]] || shift
@@ -2237,6 +2344,7 @@ main() {
     group-list)   group_list "$@" ;;
     sync)         admin_sync "$@" ;;
     apply)        admin_apply "$@" ;;
+    agent-branches) agent_branches "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "Unknown command: $command_name" ;;

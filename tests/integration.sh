@@ -179,7 +179,7 @@ test_server_commands_from_unreadable_directory() {
   local out
   out=$("$SCRIPT" status --git-user "$GL_USER")
   printf '%s\n' "$out"
-  printf '%s\n' "$out" | grep -Eq '^Default branch: +trunk$'
+  grep -Eq '^Default branch: +trunk$' <<<"$out"
 
   # doctor exits non-zero on hosts without a running sshd; only the
   # Gitolite checks matter here. The pipe on stdin used to make it hang.
@@ -294,6 +294,16 @@ test_gitolite_enforces_agent_acl() {
 
   # The admin identity has no access to project repositories at all.
   expect_push deny admin 'HEAD:refs/heads/admin-test'
+
+  # The owner lists the agent work. The base branch comes from the
+  # repository HEAD that Gitolite reports (trunk).
+  local review="$TMP/review" out
+  client git clone --quiet as-arthur:project-x "$review"
+  out=$(cd "$review" && client "$SCRIPT" agent-branches)
+  printf '%s\n' "$out"
+  assert_contains "$out" 'counted against origin/trunk'
+  grep -Eq '^agent-impl +agent/agent-impl/issue-42 ' <<<"$out"
+  grep -Eq '^agent-fix +agent/agent-fix/issue-7 ' <<<"$out"
 }
 
 test_groups_apply_to_every_repository_using_them() {
@@ -402,10 +412,10 @@ test_sshd_accepts_hardening_dropin() {
 
   sshd -t -f "$dir/sshd_config"
   out=$(sshd -T -f "$dir/sshd_config" -C "user=$GL_USER,host=localhost,addr=127.0.0.1")
-  printf '%s\n' "$out" | grep -qx 'acceptenv GIT_PROTOCOL'
-  printf '%s\n' "$out" | grep -qx 'permittty no'
+  grep -qx 'acceptenv GIT_PROTOCOL' <<<"$out"
+  grep -qx 'permittty no' <<<"$out"
   out=$(sshd -T -f "$dir/sshd_config" -C "user=root,host=localhost,addr=127.0.0.1")
-  if printf '%s\n' "$out" | grep -qx 'acceptenv GIT_PROTOCOL'; then
+  if grep -qx 'acceptenv GIT_PROTOCOL' <<<"$out"; then
     printf '  GIT_PROTOCOL must only be accepted for the hosting user\n'
     return 1
   fi

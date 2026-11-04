@@ -58,6 +58,12 @@ sync
 apply
 ```
 
+Project commands (run inside a clone of a project repository):
+
+```text
+agent-branches
+```
+
 ## 1. Generate a dedicated admin key
 
 On the administrator workstation, preferably with a FIDO2 security key, so
@@ -718,16 +724,28 @@ Limits:
 ### Reviewing and merging agent work
 
 Agents never write to the main branches; the owner merges their work. In a
-clone of the project on your workstation:
+clone of the project on your workstation, start with an overview:
 
 ```bash
-# Fetch all branches, including agent/*, and drop deleted ones
-git fetch --prune origin
+/path/to/mini-git-server.sh agent-branches
+```
 
-# List agent branches, newest first
-git for-each-ref --sort=-committerdate refs/remotes/origin/agent \
-  --format='%(committerdate:short) %(refname:short) %(subject)'
+```text
+AGENT       BRANCH                    AHEAD  BEHIND  UPDATED           SUBJECT
+agent-impl  agent/agent-impl/issue-1      2       0  3 hours ago       Step two
+agent-fix   agent/agent-fix/typo          0       1  2 days ago        Fix a typo
 
+Ahead and behind are counted against origin/trunk.
+```
+
+`agent-branches` fetches first, lists the newest branches first, and
+compares them with the remote's default branch (its `HEAD`), so it does not
+assume a branch name. Use `--base BRANCH` to compare with another branch,
+`--remote NAME` for another remote, and `--no-fetch` to skip fetching.
+
+Then look at, merge and clean up the branches with plain Git:
+
+```bash
 # See what one branch adds on top of trunk
 git log --oneline trunk..origin/agent/agent-impl/issue-42
 git diff trunk...origin/agent/agent-impl/issue-42
@@ -740,10 +758,14 @@ git switch trunk
 git merge --no-ff origin/agent/agent-impl/issue-42
 git push origin trunk
 
-# List agent branches that are merged, then delete them on the server
-git branch -r --merged trunk --list 'origin/agent/*'
+# List agent branches whose commits are all in trunk, with the commands
+# that delete them on the server
+/path/to/mini-git-server.sh agent-branches --merged
 git push origin --delete agent/agent-impl/issue-42
 ```
+
+Branches merged with squash or rebase still show commits ahead in
+`agent-branches`, because their own commits are not in the base branch.
 
 A review agent listed in `--readers` can only read. To let it hand back
 fixes or notes as a branch, list it in `--agents` instead: it then gets its

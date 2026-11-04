@@ -1125,6 +1125,93 @@ test_ssh_limits_rejects_both_options() {
   assert_contains "$out" 'either --max-startups or --reset'
 }
 
+# Build TMP/origin.git (HEAD -> trunk) and a clone TMP/clone with:
+#   agent/agent-fix/typo     merged into trunk with --no-ff (older)
+#   agent/agent-impl/issue-1 two commits not in trunk (newest)
+new_project_with_agent_branches() {
+  local tmp=$1
+  local work="$tmp/work"
+  commit_at() {
+    GIT_AUTHOR_DATE=$1 GIT_COMMITTER_DATE=$1 \
+      git -C "$work" -c user.name=Test -c user.email=test@example.invalid commit -q --allow-empty -m "$2"
+  }
+  git init -q -b trunk "$work"
+  commit_at '2026-01-01T00:00:00Z' base
+  git init -q --bare -b trunk "$tmp/origin.git"
+  git -C "$work" push -q "$tmp/origin.git" trunk
+
+  git -C "$work" switch -q -c fix
+  commit_at '2026-01-02T00:00:00Z' 'Fix a typo'
+  git -C "$work" push -q "$tmp/origin.git" fix:refs/heads/agent/agent-fix/typo
+  git -C "$work" switch -q trunk
+  GIT_COMMITTER_DATE='2026-01-03T00:00:00Z' \
+    git -C "$work" -c user.name=Test -c user.email=test@example.invalid merge -q --no-ff -m 'Merge typo fix' fix
+  git -C "$work" push -q "$tmp/origin.git" trunk
+
+  git -C "$work" switch -q -c impl
+  commit_at '2026-01-04T00:00:00Z' 'Step one'
+  commit_at '2026-01-05T00:00:00Z' 'Step two'
+  git -C "$work" push -q "$tmp/origin.git" impl:refs/heads/agent/agent-impl/issue-1
+
+  git clone -q "$tmp/origin.git" "$tmp/clone"
+}
+
+test_agent_branches_lists_branches_against_the_default_branch() {
+  local tmp out impl_line fix_line
+  tmp=$(new_tmp)
+  new_project_with_agent_branches "$tmp"
+
+  out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches)
+  grep -Eq '^agent-impl +agent/agent-impl/issue-1 +2 +0 .*Step two$' <<<"$out"
+  grep -Eq '^agent-fix +agent/agent-fix/typo +0 +1 .*Fix a typo$' <<<"$out"
+  assert_contains "$out" 'counted against origin/trunk'
+  # Newest first.
+  impl_line=$(printf '%s\n' "$out" | grep -n 'agent/agent-impl/issue-1' | cut -d: -f1)
+  fix_line=$(printf '%s\n' "$out" | grep -n 'agent/agent-fix/typo' | cut -d: -f1)
+  (( impl_line < fix_line ))
+}
+
+test_agent_branches_merged_prints_delete_commands() {
+  local tmp out
+  tmp=$(new_tmp)
+  new_project_with_agent_branches "$tmp"
+
+  out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches --merged)
+  assert_contains "$out" 'agent/agent-fix/typo'
+  assert_not_contains "$out" 'agent/agent-impl/issue-1'
+  assert_contains "$out" '  git push origin --delete agent/agent-fix/typo'
+}
+
+test_agent_branches_finds_or_asks_for_the_base_branch() {
+  local tmp out
+  tmp=$(new_tmp)
+  new_project_with_agent_branches "$tmp"
+  git -C "$tmp/clone" remote set-head origin -d
+
+  # Without origin/HEAD, it asks the remote (this needs a fetch).
+  out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches)
+  assert_contains "$out" 'counted against origin/trunk'
+
+  git -C "$tmp/clone" remote set-head origin -d
+  if out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches --no-fetch 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'Pass --base BRANCH'
+
+  out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches --no-fetch --base trunk)
+  assert_contains "$out" 'agent/agent-impl/issue-1'
+
+  if out=$(cd "$tmp/clone" && "$SCRIPT" agent-branches --base no-such-branch 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" "Branch 'no-such-branch' was not found on 'origin'"
+
+  if out=$(cd "$tmp" && "$SCRIPT" agent-branches 2>&1); then
+    return 1
+  fi
+  assert_contains "$out" 'inside a clone of a project repository'
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -1174,6 +1261,9 @@ run_test 'group members are checked for role overlap and agent names' test_group
 run_test 'group-remove refuses a group that is still used' test_group_remove_refuses_group_in_use
 run_test 'repo-set warns about a group not managed by group-set' test_repo_set_warns_about_unmanaged_group
 run_test 'repo-set --agent-rewind round-trips through repo-show' test_repo_set_agent_rewind_and_repo_show_round_trip
+run_test 'agent-branches lists agent branches against the default branch' test_agent_branches_lists_branches_against_the_default_branch
+run_test 'agent-branches --merged prints delete commands' test_agent_branches_merged_prints_delete_commands
+run_test 'agent-branches finds the base branch, or asks for it' test_agent_branches_finds_or_asks_for_the_base_branch
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
