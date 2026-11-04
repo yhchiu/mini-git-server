@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Integration tests against a real Gitolite installation.
 #
-# Requirements: root, gitolite3, git, ssh-keygen, runuser and useradd.
+# Requirements: root, gitolite3, git, ssh-keygen, runuser and useradd, and
+# python3 and curl for share.
 #
 # The tests create a temporary hosting account and remove it afterwards.
 # They do not start sshd and do not change the system SSH configuration:
@@ -27,7 +28,7 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   printf 'Integration tests must run as root (try: sudo make test-integration).\n' >&2
   exit 1
 fi
-for cmd in git gitolite ssh-keygen runuser useradd userdel timeout; do
+for cmd in git gitolite ssh-keygen runuser useradd userdel timeout python3 curl; do
   command -v "$cmd" >/dev/null 2>&1 || {
     printf 'Missing required command: %s\n' "$cmd" >&2
     exit 1
@@ -306,6 +307,40 @@ test_gitolite_enforces_agent_acl() {
   grep -Eq '^agent-fix +agent/agent-fix/issue-7 ' <<<"$out"
 }
 
+test_share_reads_through_gitolite_as_the_caller() {
+  printf 'shared\n' >"$WORK/SHARED"
+  git -C "$WORK" add SHARED
+  git -C "$WORK" -c user.name=Test -c user.email=test@example.invalid \
+    commit --quiet -m 'Add a file to share'
+  expect_push allow arthur 'HEAD:refs/heads/release'
+
+  local out="$TMP/share.out" target="$TMP/share-target" pid i
+  # share reads with the caller's identity. admin cannot read project-x,
+  # so it cannot share it either.
+  if client "$SCRIPT" share --from as-admin:project-x --ref release --bind 127.0.0.1 >"$out" 2>&1; then
+    printf '  share as admin should have failed\n'
+    return 1
+  fi
+  cat "$out"
+  assert_contains "$(cat "$out")" 'DENIED'
+
+  # A reader can share it, and the target needs no key at all.
+  client "$SCRIPT" share --from as-ci:project-x --ref release --bind 127.0.0.1 --ttl 2m \
+    >"$out" 2>"$out.err" &
+  pid=$!
+  for ((i = 0; i < 300; i++)); do
+    grep -q '^URL:' "$out" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  cat "$out"
+  mkdir "$target"
+  (cd "$target" && bash -c "$(grep -A1 '^On the target:' "$out" | tail -n 1)")
+  assert_eq shared "$(cat "$target/project-x-release/SHARED")"
+  wait "$pid"
+  cat "$out.err"
+}
+
 test_groups_apply_to_every_repository_using_them() {
   ssh-keygen -q -t ed25519 -N '' -C agent-new -f "$KEYS/agent-new"
   client "$SCRIPT" user-add --admin-dir "$ADMIN" --name agent-new --key "$KEYS/agent-new.pub"
@@ -478,6 +513,7 @@ step 'doctor lints authorized_keys when stdin is not a terminal' test_doctor_lin
 step 'documented admin workflow is applied by Gitolite' test_admin_workflow_is_applied
 step 'user-remove refuses to remove the only admin key' test_user_remove_protects_real_admin_key
 step 'Gitolite enforces the generated agent, writer and reader ACL' test_gitolite_enforces_agent_acl
+step 'share reads through Gitolite with the identity of the caller' test_share_reads_through_gitolite_as_the_caller
 step 'groups apply to every repository that uses them' test_groups_apply_to_every_repository_using_them
 step '--agent-rewind allows rewinds only in the own namespace, and they are recoverable' test_agent_rewind_is_limited_to_own_branches_and_recoverable
 step 'two admin machines stay in sync with sync and apply' test_two_admin_machines_with_sync

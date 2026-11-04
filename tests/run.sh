@@ -9,6 +9,7 @@ SCRIPT="$ROOT_DIR/mini-git-server.sh"
 
 PASS=0
 FAIL=0
+SKIP=0
 CURRENT_TMP=""
 
 cleanup() {
@@ -112,6 +113,21 @@ run_test() {
   else
     fail "$name"
   fi
+}
+
+# Like run_test, but skip the test when a command it needs is not
+# installed. CI installs all of them, so there every test runs.
+run_test_needing() {
+  local name=$1 fn=$2 cmd
+  shift 2
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      printf 'ok - %s # SKIP %s is not installed\n' "$name" "$cmd"
+      SKIP=$((SKIP + 1))
+      return 0
+    fi
+  done
+  run_test "$name" "$fn"
 }
 
 test_run_test_catches_a_failed_check_in_the_middle() {
@@ -1212,6 +1228,258 @@ test_agent_branches_finds_or_asks_for_the_base_branch() {
   assert_contains "$out" 'inside a clone of a project repository'
 }
 
+# A bare repository for share: trunk with two commits, a tag v1 on the
+# first one, and a branch with a slash in its name.
+new_share_origin() {
+  local tmp=$1
+  local work="$tmp/share-work"
+  git init -q -b trunk "$work"
+  printf 'hello\n' >"$work/README"
+  mkdir "$work/bin"
+  printf '#!/bin/sh\necho run\n' >"$work/bin/run"
+  chmod +x "$work/bin/run"
+  ln -s README "$work/LINK"
+  git -C "$work" add .
+  git -C "$work" -c user.name=Test -c user.email=test@example.invalid commit -qm first
+  git -C "$work" tag v1
+  printf 'second\n' >>"$work/README"
+  git -C "$work" -c user.name=Test -c user.email=test@example.invalid commit -qam second
+  git -C "$work" branch release/1
+  git init -q --bare -b trunk "$tmp/origin.git"
+  git -C "$work" push -q "$tmp/origin.git" trunk release/1 v1
+  # share creates its temporary directory here, so the tests can check
+  # that nothing is left behind.
+  mkdir "$tmp/tmpdir"
+}
+
+# Start share in the background, with TMP/tmpdir as its temporary
+# directory, and wait until it prints the URL. Sets SHARE_PID and SHARE_URL.
+# Output goes to TMP/share.out and TMP/share.out.err. Stops share when the
+# test ends, also when it fails.
+#
+# A background command of a non-interactive shell starts with SIGINT
+# ignored, and Bash cannot trap a signal that was ignored on entry. Reset it,
+# so share sees Ctrl-C as it would in a terminal.
+start_share() {
+  local tmp=$1 i out="$1/share.out"
+  shift
+  env --default-signal=INT TMPDIR="$tmp/tmpdir" "$SCRIPT" share "$@" >"$out" 2>"$out.err" &
+  SHARE_PID=$!
+  trap 'kill "$SHARE_PID" 2>/dev/null || true' EXIT
+  for ((i = 0; i < 300; i++)); do
+    grep -q '^URL:' "$out" 2>/dev/null && break
+    kill -0 "$SHARE_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  SHARE_URL=$(awk '/^URL:/ {print $2}' "$out")
+  [[ -n $SHARE_URL ]] || { cat "$out.err" >&2; return 1; }
+}
+
+# Wait up to SECONDS for share to end, and set SHARE_RC to its exit status.
+# Do not call it in $(...): only the shell that started share can wait for it.
+wait_for_share() {
+  local seconds=$1 i
+  for ((i = 0; i < seconds * 10; i++)); do
+    kill -0 "$SHARE_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$SHARE_PID" 2>/dev/null; then
+    printf '  share is still running after %ss\n' "$seconds" >&2
+    return 1
+  fi
+  SHARE_RC=0
+  wait "$SHARE_PID" || SHARE_RC=$?
+}
+
+# The command that share prints for the target.
+share_target_command() {
+  grep -A1 '^On the target:' "$1" | tail -n 1
+}
+
+# Print the HTTP status of URL, or 000 when nothing answers.
+http_status() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || true
+}
+
+test_share_rejects_bad_options() {
+  local tmp out
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  local -a ok=(--from "$tmp/origin.git" --ref trunk --bind 127.0.0.1)
+  export TMPDIR="$tmp/tmpdir"
+
+  if out=$("$SCRIPT" share --from "$tmp/origin.git" --ref trunk 2>&1); then return 1; fi
+  assert_contains "$out" '--from, --ref and --bind are required'
+  if out=$("$SCRIPT" share --from "$tmp/origin.git" --ref -x --bind 127.0.0.1 2>&1); then return 1; fi
+  assert_contains "$out" 'Invalid --ref'
+  if out=$("$SCRIPT" share --from '-oProxyCommand=x' --ref trunk --bind 127.0.0.1 2>&1); then return 1; fi
+  assert_contains "$out" 'Invalid --from'
+  if out=$("$SCRIPT" share --from "$tmp/origin.git" --ref trunk --bind 'a b' 2>&1); then return 1; fi
+  assert_contains "$out" 'Invalid --bind'
+  if out=$("$SCRIPT" share "${ok[@]}" --format rar 2>&1); then return 1; fi
+  assert_contains "$out" '--format must be tar.gz or zip'
+  if out=$("$SCRIPT" share "${ok[@]}" --depth 0 2>&1); then return 1; fi
+  assert_contains "$out" '--depth must be a positive number'
+  if out=$("$SCRIPT" share "${ok[@]}" --port 70000 2>&1); then return 1; fi
+  assert_contains "$out" 'Invalid --port'
+  if out=$("$SCRIPT" share "${ok[@]}" --ttl 25h 2>&1); then return 1; fi
+  assert_contains "$out" '--ttl must be between 1s and 24h'
+  if out=$("$SCRIPT" share "${ok[@]}" --ttl 5x 2>&1); then return 1; fi
+  assert_contains "$out" 'Invalid --ttl'
+  if out=$("$SCRIPT" share "${ok[@]}" --max-downloads -1 2>&1); then return 1; fi
+  assert_contains "$out" '--max-downloads must be a number'
+  # Nothing was created for any of them.
+  assert_eq '' "$(ls -A "$tmp/tmpdir")"
+}
+
+test_share_serves_one_download_and_removes_everything() {
+  local tmp out token target
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  start_share "$tmp" --from "$tmp/origin.git" --ref trunk --bind 127.0.0.1
+  token=$(cut -d/ -f4 <<<"$SHARE_URL")
+  [[ $token =~ ^[0-9a-f]{32}$ ]]
+  [[ $SHARE_URL == http://127.0.0.1:*/"$token"/origin-trunk.tar.gz ]]
+
+  # Only the exact URL works.
+  assert_eq 404 "$(http_status "${SHARE_URL/$token/00000000000000000000000000000000}")"
+  assert_eq 404 "$(http_status "${SHARE_URL%/"$token"/*}/")"
+  # While it is served, the archive is not on the disk, and the token is
+  # not in the arguments of any process.
+  assert_eq '' "$(find "$tmp/tmpdir" -type f)"
+  # Read the token from a file, so this grep does not find its own arguments.
+  printf '%s\n' "$token" >"$tmp/token"
+  if grep -qsFf "$tmp/token" /proc/[0-9]*/cmdline; then
+    printf '  the token is visible in a process command line\n' >&2
+    return 1
+  fi
+
+  # The printed command downloads, checks and extracts the archive.
+  target="$tmp/target"
+  mkdir "$target"
+  (cd "$target" && bash -c "$(share_target_command "$out")" >/dev/null)
+  assert_eq $'hello\nsecond' "$(cat "$target/origin-trunk/README")"
+  [[ -x $target/origin-trunk/bin/run ]]
+  [[ -L $target/origin-trunk/LINK ]]
+  [[ ! -e $target/origin-trunk/.git ]]
+
+  # One download is the default limit: share stops and removes everything.
+  wait_for_share 10
+  assert_eq 0 "$SHARE_RC"
+  assert_eq 000 "$(http_status "$SHARE_URL")"
+  assert_eq '' "$(ls -A "$tmp/tmpdir")"
+  assert_contains "$(cat "$out.err")" 'downloaded origin-trunk.tar.gz (1 of 1)'
+  assert_contains "$(cat "$out.err")" 'Stopped. Removed'
+}
+
+test_share_depth_gives_a_shallow_clone_without_the_remote() {
+  local tmp out target dir
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  start_share "$tmp" --from "$tmp/origin.git" --ref v1 --depth 1 --bind 127.0.0.1
+  target="$tmp/target"
+  mkdir "$target"
+  (cd "$target" && bash -c "$(share_target_command "$out")" >/dev/null)
+  dir="$target/origin-v1"
+  assert_eq hello "$(cat "$dir/README")"
+  assert_eq true "$(git -C "$dir" rev-parse --is-shallow-repository)"
+  assert_eq 1 "$(git -C "$dir" rev-list --count HEAD)"
+  assert_eq first "$(git -C "$dir" log -1 --format=%s)"
+  assert_eq '' "$(git -C "$dir" remote)"
+  [[ ! -e $dir/.git/logs ]]
+  assert_eq '' "$(git -C "$dir" status --porcelain)"
+  wait_for_share 10
+  assert_eq 0 "$SHARE_RC"
+}
+
+test_share_zip_allows_several_downloads() {
+  local tmp out listing
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  start_share "$tmp" --from "$tmp/origin.git" --ref release/1 --format zip --max-downloads 2 --bind 127.0.0.1
+  [[ $SHARE_URL == */origin-release-1.zip ]]
+  assert_contains "$(cat "$out")" "unzip -q 'origin-release-1.zip'"
+  curl -fsS -o "$tmp/1.zip" "$SHARE_URL"
+  curl -fsS -o "$tmp/2.zip" "$SHARE_URL"
+  cmp "$tmp/1.zip" "$tmp/2.zip"
+  listing=$(python3 -m zipfile -l "$tmp/1.zip")
+  assert_contains "$listing" 'origin-release-1/README'
+  assert_contains "$listing" 'origin-release-1/bin/run'
+  wait_for_share 10
+  assert_eq 0 "$SHARE_RC"
+  assert_contains "$(cat "$out.err")" '(2 of 2)'
+  assert_eq '' "$(ls -A "$tmp/tmpdir")"
+}
+
+test_share_stops_on_ctrl_c_on_hangup_and_after_kill_9() {
+  local tmp out signal
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  for signal in INT:130 HUP:129; do
+    start_share "$tmp" --from "$tmp/origin.git" --ref trunk --bind 127.0.0.1
+    # HEAD requests do not count as downloads.
+    assert_eq 200 "$(http_status -I "$SHARE_URL")"
+    kill -s "${signal%:*}" "$SHARE_PID"
+    wait_for_share 10
+    assert_eq "${signal#*:}" "$SHARE_RC" "exit status after SIG${signal%:*}"
+    assert_eq 000 "$(http_status -I "$SHARE_URL")"
+    assert_eq '' "$(ls -A "$tmp/tmpdir")"
+  done
+
+  # kill -9 cannot be caught. The server notices that share is gone and
+  # stops; the archive was never on the disk, so only an empty directory
+  # is left.
+  start_share "$tmp" --from "$tmp/origin.git" --ref trunk --bind 127.0.0.1
+  kill -9 "$SHARE_PID"
+  { wait "$SHARE_PID"; } 2>/dev/null || true
+  local i status
+  for ((i = 0; i < 50; i++)); do
+    status=$(http_status -I "$SHARE_URL")
+    [[ $status == 000 ]] && break
+    sleep 0.1
+  done
+  assert_eq 000 "$status" 'the server kept running after kill -9'
+  assert_eq '' "$(find "$tmp/tmpdir" -type f)"
+}
+
+test_share_stops_after_the_time_limit() {
+  local tmp out
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  start_share "$tmp" --from "$tmp/origin.git" --ref trunk --ttl 1s --max-downloads 0 --bind 127.0.0.1
+  wait_for_share 10
+  assert_eq 0 "$SHARE_RC"
+  assert_contains "$(cat "$out.err")" 'the time limit is reached'
+  assert_eq '' "$(ls -A "$tmp/tmpdir")"
+}
+
+test_share_tls_pins_the_certificate() {
+  local tmp out target command
+  tmp=$(new_tmp)
+  new_share_origin "$tmp"
+  out="$tmp/share.out"
+  start_share "$tmp" --from "$tmp/origin.git" --ref trunk --tls --bind 127.0.0.1
+  [[ $SHARE_URL == https://* ]]
+  command=$(share_target_command "$out")
+  assert_contains "$command" "--pinnedpubkey 'sha256//"
+  # An unpinned client refuses the self-signed certificate, and a wrong pin
+  # is refused too. Neither counts as a download.
+  assert_eq 000 "$(http_status "$SHARE_URL")"
+  assert_eq 000 "$(http_status -k --pinnedpubkey 'sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "$SHARE_URL")"
+  target="$tmp/target"
+  mkdir "$target"
+  (cd "$target" && bash -c "$command" >/dev/null)
+  assert_eq $'hello\nsecond' "$(cat "$target/origin-trunk/README")"
+  wait_for_share 10
+  assert_eq 0 "$SHARE_RC"
+  assert_eq '' "$(ls -A "$tmp/tmpdir")"
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -1264,6 +1532,17 @@ run_test 'repo-set --agent-rewind round-trips through repo-show' test_repo_set_a
 run_test 'agent-branches lists agent branches against the default branch' test_agent_branches_lists_branches_against_the_default_branch
 run_test 'agent-branches --merged prints delete commands' test_agent_branches_merged_prints_delete_commands
 run_test 'agent-branches finds the base branch, or asks for it' test_agent_branches_finds_or_asks_for_the_base_branch
+run_test 'share rejects invalid options before creating anything' test_share_rejects_bad_options
+run_test_needing 'share serves one download, then stops and removes everything' test_share_serves_one_download_and_removes_everything python3 curl
+run_test_needing 'share --depth gives a shallow clone without the remote' test_share_depth_gives_a_shallow_clone_without_the_remote python3 curl
+run_test_needing 'share --format zip with --max-downloads 2' test_share_zip_allows_several_downloads python3 curl
+run_test_needing 'share stops on Ctrl-C, on hangup and after kill -9' test_share_stops_on_ctrl_c_on_hangup_and_after_kill_9 python3 curl
+run_test_needing 'share stops after the time limit' test_share_stops_after_the_time_limit python3 curl
+run_test_needing 'share --tls pins the throwaway certificate' test_share_tls_pins_the_certificate python3 curl openssl
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+if (( SKIP )); then
+  printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+else
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 (( FAIL == 0 ))

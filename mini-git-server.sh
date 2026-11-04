@@ -58,6 +58,9 @@ Admin-workstation commands (run inside or against a gitolite-admin clone):
 Project commands (run inside a clone of a project repository):
   agent-branches  List agent branches and how far they are from the base branch
 
+Deploy commands (run on any machine that can read the repository):
+  share           Serve an archive of a branch or tag at a temporary random URL
+
 Other:
   version         Show script version
   help            Show this help
@@ -2318,6 +2321,411 @@ agent_branches() {
   fi
 }
 
+share_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh share --from LOCATION --ref REF --bind ADDRESS [options]
+
+Builds a tar.gz or zip archive of one branch or tag and serves it at a
+random URL. It stops when the time limit or the download limit is reached,
+or on Ctrl-C, and then removes everything it created. Use it for a one-off
+deploy to a machine that has no key for the Git server: the target only
+needs curl, sha256sum and tar (or unzip).
+
+Required:
+  --from LOCATION     Repository to read, as given to git clone, for example
+                      internal-git:project-x. It is read with your own
+                      identity, so you can only share what you can read.
+  --ref REF           Branch or tag to share
+  --bind ADDRESS      Address to listen on, for example 10.0.0.5. Use
+                      0.0.0.0 or :: only if every network this machine is
+                      on may reach it.
+
+Options:
+  --depth N           Include .git with the last N commits, so the target
+                      gets a shallow clone. By default the archive holds
+                      only the files.
+  --format FORMAT     tar.gz (default) or zip
+  --tls               Serve HTTPS with a throwaway self-signed certificate.
+                      The printed curl command pins its key, so no CA is
+                      needed. Use this on networks you do not trust.
+  --port PORT         Port to listen on (default: a random free port)
+  --url-host NAME     Host name or address to print in the URL (default:
+                      the --bind address, or this machine's first address)
+  --ttl TIME          Stop after TIME, for example 90s, 30m or 2h; at most
+                      24h (default: 30m). Downloads in progress may finish.
+  --max-downloads N   Stop after N complete downloads; 0 means no limit
+                      within --ttl (default: 1)
+  -h, --help
+
+Without --tls, anyone on the network path can read the archive and change
+it in transit. The printed command checks the SHA-256 checksum, so send it
+to the target over a channel you trust, for example your SSH session.
+
+The URL is a secret: anyone who has it can download the archive until the
+share stops. Needs python3, and openssl for --tls. Submodules are not
+included, and Git LFS files contain only their pointers.
+USAGE
+}
+
+# share keeps its state here, so that share_cleanup can run from a trap.
+SHARE_WORK=""
+SHARE_SERVER_PID=""
+
+share_cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if [[ -n $SHARE_SERVER_PID ]]; then
+    kill "$SHARE_SERVER_PID" 2>/dev/null || true
+    wait "$SHARE_SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n $SHARE_WORK ]]; then
+    rm -rf -- "$SHARE_WORK"
+    log "Stopped. Removed $SHARE_WORK"
+  fi
+  exit "$rc"
+}
+
+# Print TIME (90, 90s, 30m or 2h) in seconds.
+share_ttl_seconds() {
+  local value=$1 seconds
+  [[ $value =~ ^([0-9]{1,6})([smh]?)$ ]] || die "Invalid --ttl: $value (use for example 90s, 30m or 2h)"
+  seconds=$((10#${BASH_REMATCH[1]}))
+  case ${BASH_REMATCH[2]} in
+    m) seconds=$((seconds * 60)) ;;
+    h) seconds=$((seconds * 3600)) ;;
+  esac
+  (( seconds >= 1 && seconds <= 86400 )) || die "--ttl must be between 1s and 24h: $value"
+  printf '%s\n' "$seconds"
+}
+
+# Print an epoch time as local date and time, with GNU or BSD date.
+share_clock() {
+  date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$1" '+%Y-%m-%d %H:%M:%S'
+}
+
+# The HTTP server behind share, run with python3. Arguments: BIND PORT
+# ARCHIVE TTL MAX_DOWNLOADS CERT KEY PORT_FILE (CERT and KEY empty without
+# TLS). The secret URL path comes in MGS_SHARE_PATH, because other users can
+# read the arguments of a process but not its environment. It writes the
+# port it listens on to PORT_FILE.
+share_server_program() {
+  cat <<'PY'
+import http.server, os, socket, ssl, sys, threading, time
+
+bind, port, archive, ttl, max_downloads, cert, key, port_file = sys.argv[1:]
+path = os.environ.pop("MGS_SHARE_PATH")
+ttl, max_downloads = float(ttl), int(max_downloads)
+name = os.path.basename(archive)
+
+
+def note(message):
+    sys.stderr.write("[INFO] %s\n" % message)
+    sys.stderr.flush()
+
+
+# Keep the archive open and remove it from the disk at once. The data stays
+# readable through this descriptor, and the kernel frees it when this
+# process ends in any way, even with kill -9.
+fd = os.open(archive, os.O_RDONLY)
+size = os.fstat(fd).st_size
+os.unlink(archive)
+
+lock = threading.Lock()
+count = {"started": 0, "done": 0}
+stopping = threading.Event()
+
+
+def stop(reason):
+    if not stopping.is_set():
+        stopping.set()
+        note("Stopping: %s." % reason)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "mini-git-server-share"
+    sys_version = ""
+    timeout = 60
+
+    def setup(self):
+        self.request.settimeout(self.timeout)
+        if cert:
+            self.request.do_handshake()
+        super().setup()
+
+    def log_message(self, format, *args):
+        pass  # requests are logged below, without the token
+
+    def do_HEAD(self):
+        self.serve(False)
+
+    def do_GET(self):
+        self.serve(True)
+
+    def serve(self, body):
+        client = self.client_address[0]
+        if self.path != path:
+            note("%s asked for an unknown path (404)" % client)
+            self.send_error(404)
+            return
+        if body:
+            with lock:
+                full = max_downloads and count["started"] >= max_downloads
+                if not full:
+                    count["started"] += 1
+            if full:
+                note("%s was refused: the download limit is reached (410)" % client)
+                self.send_error(410)
+                return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not body:
+            return
+        note("%s started a download" % client)
+        offset = 0
+        try:
+            while offset < size:
+                chunk = os.pread(fd, 1 << 20, offset)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                offset += len(chunk)
+            self.wfile.flush()
+        except OSError:
+            with lock:
+                count["started"] -= 1  # give the slot back
+            note("%s stopped before the end of the download" % client)
+            return
+        with lock:
+            count["done"] += 1
+            done = count["done"]
+        if max_downloads:
+            note("%s downloaded %s (%d of %d)" % (client, name, done, max_downloads))
+            if done >= max_downloads:
+                stop("the download limit is reached")
+        else:
+            note("%s downloaded %s (%d)" % (client, name, done))
+
+
+class Server(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    # Let downloads in progress finish when the share stops.
+    daemon_threads = False
+
+    def handle_error(self, request, client_address):
+        note("%s: connection failed: %s" % (client_address[0], sys.exc_info()[1]))
+
+
+try:
+    server = Server((bind, int(port)), Handler)
+except OSError as error:
+    sys.stderr.write("[ERROR] Cannot listen on %s port %s: %s\n" % (bind, port, error.strerror))
+    sys.exit(1)
+if cert:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    os.unlink(cert)
+    os.unlink(key)
+    # Handshake in each connection's own thread, so that one client that
+    # never completes it cannot hold up the others.
+    server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+
+if ttl > 0:
+    timer = threading.Timer(ttl, stop, args=("the time limit is reached",))
+    timer.daemon = True
+    timer.start()
+
+# Stop when the share command is gone, for example after kill -9.
+parent = os.getppid()
+
+
+def watch_parent():
+    while not stopping.is_set():
+        if os.getppid() != parent:
+            stop("the share command is gone")
+            return
+        time.sleep(1)
+
+
+threading.Thread(target=watch_parent, daemon=True).start()
+
+with open(port_file + ".tmp", "w") as f:
+    f.write("%d\n" % server.server_address[1])
+os.rename(port_file + ".tmp", port_file)
+try:
+    server.serve_forever()
+except KeyboardInterrupt:
+    pass
+server.server_close()
+PY
+}
+
+share() {
+  local from="" ref="" bind="" depth="" format="tar.gz" tls=0 port=0 url_host=""
+  local ttl="30m" max_downloads=1
+  while (($#)); do
+    case "$1" in
+      --from) [[ $# -ge 2 ]] || die "--from requires a value"; from=$2; shift 2 ;;
+      --ref) [[ $# -ge 2 ]] || die "--ref requires a value"; ref=$2; shift 2 ;;
+      --bind) [[ $# -ge 2 ]] || die "--bind requires a value"; bind=$2; shift 2 ;;
+      --depth) [[ $# -ge 2 ]] || die "--depth requires a value"; depth=$2; shift 2 ;;
+      --format) [[ $# -ge 2 ]] || die "--format requires a value"; format=$2; shift 2 ;;
+      --tls) tls=1; shift ;;
+      --port) [[ $# -ge 2 ]] || die "--port requires a value"; port=$2; shift 2 ;;
+      --url-host) [[ $# -ge 2 ]] || die "--url-host requires a value"; url_host=$2; shift 2 ;;
+      --ttl) [[ $# -ge 2 ]] || die "--ttl requires a value"; ttl=$2; shift 2 ;;
+      --max-downloads) [[ $# -ge 2 ]] || die "--max-downloads requires a value"; max_downloads=$2; shift 2 ;;
+      -h|--help) share_usage; return 0 ;;
+      *) die "Unknown share option: $1" ;;
+    esac
+  done
+  [[ -n $from && -n $ref && -n $bind ]] || die "--from, --ref and --bind are required"
+  need_cmd git
+  [[ $from != -* ]] || die "Invalid --from: $from"
+  git check-ref-format --branch "$ref" >/dev/null 2>&1 || die "Invalid --ref (expected a branch or tag name): $ref"
+  [[ $bind =~ ^[A-Za-z0-9._:-]+$ && $bind != -* ]] || die "Invalid --bind address: $bind"
+  [[ -z $url_host || ( $url_host =~ ^[A-Za-z0-9._:-]+$ && $url_host != -* ) ]] || die "Invalid --url-host: $url_host"
+  [[ -z $depth || $depth =~ ^[1-9][0-9]{0,8}$ ]] || die "--depth must be a positive number: $depth"
+  [[ $format == tar.gz || $format == zip ]] || die "--format must be tar.gz or zip: $format"
+  if [[ ! $port =~ ^[0-9]{1,5}$ ]] || (( 10#$port > 65535 )); then
+    die "Invalid --port: $port"
+  fi
+  [[ $max_downloads =~ ^[0-9]{1,6}$ ]] || die "--max-downloads must be a number: $max_downloads"
+  max_downloads=$((10#$max_downloads))
+  local ttl_seconds
+  ttl_seconds=$(share_ttl_seconds "$ttl")
+
+  need_cmd python3
+  need_cmd sha256sum
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 7))' || die "share needs Python 3.7 or newer."
+  (( tls )) && need_cmd openssl
+  [[ -n $depth && $format == zip ]] && need_cmd zip
+
+  # Name the archive after the repository and the ref, using only
+  # characters that need no quoting on the target.
+  local name base
+  name=${from%/}
+  name=${name##*[:/]}
+  name=${name%.git}
+  base=$(printf '%s-%s' "$name" "$ref" | tr -c 'A-Za-z0-9._-' '-')
+  [[ $base =~ ^[A-Za-z0-9] ]] || base="repo-$base"
+
+  SHARE_WORK=$(mktemp -d "${TMPDIR:-/tmp}/mgs-share.XXXXXXXX")
+  trap share_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  local file="$SHARE_WORK/$base.$format"
+  if [[ -z $depth ]]; then
+    log "Exporting '$ref' from $from"
+    git archive --remote="$from" --format="$format" --prefix="$base/" "$ref" >"$file" || \
+      die "Could not export '$ref' from $from."
+  else
+    local src="$SHARE_WORK/src/$base"
+    log "Cloning '$ref' from $from with depth $depth"
+    # --no-local: Git ignores --depth when it copies a local repository.
+    git clone --quiet --no-local --depth "$depth" --single-branch --branch "$ref" -- "$from" "$src" || \
+      die "Could not clone '$ref' from $from."
+    # The target cannot reach the Git server with this URL anyway, so do
+    # not hand it over: drop the remote and the reflog that names it.
+    git -C "$src" remote remove origin
+    rm -rf -- "$src/.git/logs"
+    if [[ $format == tar.gz ]]; then
+      tar -C "$SHARE_WORK/src" -czf "$file" "$base"
+    else
+      (cd "$SHARE_WORK/src" && zip -qry "$file" "$base")
+    fi
+    rm -rf -- "$SHARE_WORK/src"
+  fi
+  local sha size
+  sha=$(sha256sum "$file" | cut -d' ' -f1)
+  size=$(du -h "$file" | cut -f1)
+
+  local cert="" key="" pin=""
+  if (( tls )); then
+    cert="$SHARE_WORK/cert.pem" key="$SHARE_WORK/key.pem"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+      -keyout "$key" -out "$cert" -days 1 -subj '/CN=mini-git-server share' >/dev/null 2>&1 || \
+      die "Could not create a TLS certificate with openssl."
+    pin=$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform der \
+      | openssl dgst -sha256 -binary | openssl enc -base64)
+  fi
+
+  # 128 random bits: the URL itself is the only secret.
+  local token url_path
+  token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  [[ $token =~ ^[0-9a-f]{32}$ ]] || die "Could not read random bytes for the URL."
+  url_path="/$token/$base.$format"
+
+  MGS_SHARE_PATH=$url_path python3 -c "$(share_server_program)" "$bind" "$port" "$file" \
+    "$ttl_seconds" "$max_downloads" "$cert" "$key" "$SHARE_WORK/port" &
+  SHARE_SERVER_PID=$!
+  local i
+  for ((i = 0; i < 100; i++)); do
+    [[ -s $SHARE_WORK/port ]] && break
+    kill -0 "$SHARE_SERVER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -s $SHARE_WORK/port ]] || die "The HTTP server did not start."
+  port=$(<"$SHARE_WORK/port")
+  rm -f "$SHARE_WORK/port"
+
+  if [[ -z $url_host ]]; then
+    case $bind in
+      0.0.0.0|::|0:0:0:0:0:0:0:0)
+        url_host=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+        [[ -n $url_host ]] || url_host=$(hostname)
+        ;;
+      *) url_host=$bind ;;
+    esac
+  fi
+  [[ $url_host != *:* ]] || url_host="[$url_host]"
+
+  local scheme=http curl_opts="-fsS" extract limits
+  if (( tls )); then
+    scheme=https
+    curl_opts="-fsSk --pinnedpubkey 'sha256//$pin'"
+  fi
+  if [[ $format == zip ]]; then
+    extract="unzip -q '$base.$format'"
+  else
+    extract="tar -xzf '$base.$format'"
+  fi
+  limits="until $(share_clock "$(( $(date +%s) + ttl_seconds ))")"
+  if (( max_downloads == 1 )); then
+    limits+=", or after 1 download"
+  elif (( max_downloads > 1 )); then
+    limits+=", or after $max_downloads downloads"
+  fi
+
+  local url="$scheme://$url_host:$port$url_path"
+  printf 'Sharing %s (%s) %s. Press Ctrl-C to stop earlier.\n\n' "$base.$format" "$size" "$limits"
+  printf 'URL:     %s\n' "$url"
+  printf 'SHA-256: %s\n\n' "$sha"
+  printf 'On the target:\n'
+  printf "  curl %s -o '%s' '%s' && echo '%s  %s' | sha256sum -c - && %s\n\n" \
+    "$curl_opts" "$base.$format" "$url" "$sha" "$base.$format" "$extract"
+  if (( tls )); then
+    printf 'Send this command to the target over a channel you trust.\n'
+  else
+    printf 'Plain HTTP: the network can read the archive. The checksum only protects\n'
+    printf 'it if this command reaches the target over a channel you trust. Use --tls\n'
+    printf 'on networks you do not trust.\n'
+  fi
+
+  local rc=0
+  wait "$SHARE_SERVER_PID" || rc=$?
+  SHARE_SERVER_PID=""
+  return "$rc"
+}
+
 main() {
   local command_name=${1:-help}
   [[ $# -eq 0 ]] || shift
@@ -2345,6 +2753,7 @@ main() {
     sync)         admin_sync "$@" ;;
     apply)        admin_apply "$@" ;;
     agent-branches) agent_branches "$@" ;;
+    share)        share "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "Unknown command: $command_name" ;;

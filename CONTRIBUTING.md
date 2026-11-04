@@ -8,9 +8,9 @@ Run the full local check before committing:
 make check
 ```
 
-The test suite is intentionally written in Bash and does not require Bats or another test framework. `shellcheck` is optional locally; GitHub Actions installs it in CI.
+The test suite is intentionally written in Bash and does not require Bats or another test framework. `shellcheck` is optional locally; GitHub Actions installs it in CI. The `share` tests need `python3` and `curl` (and `openssl` for `--tls`); without them they are skipped locally, but CI always runs them.
 
-Changes to server commands, generated ACLs, or anything that talks to Gitolite should also pass the integration tests. They need root and the `gitolite3` package, so run them on a disposable machine or container:
+Changes to server commands, generated ACLs, or anything that talks to Gitolite should also pass the integration tests. They need root, the `gitolite3` package, `python3` and `curl`, so run them on a disposable machine or container:
 
 ```bash
 sudo make test-integration
