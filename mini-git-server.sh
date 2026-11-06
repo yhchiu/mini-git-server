@@ -885,9 +885,9 @@ server_doctor() {
     local admin_repo="$git_home/repositories/gitolite-admin.git" admin_head
     admin_head=$(runuser -u "$git_user" -- git -C "$admin_repo" symbolic-ref --quiet HEAD 2>/dev/null || true)
     if [[ $admin_head != "refs/heads/$GITOLITE_ADMIN_BRANCH" ]]; then
-      check_bad "gitolite-admin HEAD is '${admin_head:-unknown}', expected refs/heads/$GITOLITE_ADMIN_BRANCH; Gitolite ignores admin pushes (see README: Repair an admin repository on the wrong branch)"
+      check_bad "gitolite-admin HEAD is '${admin_head:-unknown}', expected refs/heads/$GITOLITE_ADMIN_BRANCH; Gitolite ignores admin pushes (see docs/administration.md: Repair an admin repository on the wrong branch)"
     elif ! runuser -u "$git_user" -- git -C "$admin_repo" show-ref --verify --quiet "refs/heads/$GITOLITE_ADMIN_BRANCH"; then
-      check_bad "gitolite-admin has no '$GITOLITE_ADMIN_BRANCH' branch yet (see README: Repair an admin repository on the wrong branch)"
+      check_bad "gitolite-admin has no '$GITOLITE_ADMIN_BRANCH' branch yet (see docs/administration.md: Repair an admin repository on the wrong branch)"
     else
       check_ok "gitolite-admin uses the '$GITOLITE_ADMIN_BRANCH' branch"
     fi
@@ -963,7 +963,7 @@ server_doctor() {
       | awk '$1 == "acceptenv" && $2 == "GIT_PROTOCOL" {found = 1} END {exit !found}'; then
       check_ok "sshd accepts GIT_PROTOCOL for $git_user (Git protocol v2)"
     else
-      check_warn "sshd does not accept GIT_PROTOCOL for $git_user, so Git uses the slower protocol v0 (see README: Many agents at once)"
+      check_warn "sshd does not accept GIT_PROTOCOL for $git_user, so Git uses the slower protocol v0 (see docs/agents.md: Many agents at once)"
     fi
   fi
 
@@ -1341,7 +1341,7 @@ user_add() {
     fi
   done < <(find "$dir/keydir" -type f -name '*.pub' -print0)
   if list_has "$(admin_identities "$dir" | tr '\n' ' ')" "$name"; then
-    warn "'$name' can push to gitolite-admin and change every access rule. Keep this key off machines where AI agents run (see README: Identities and keys)."
+    warn "'$name' can push to gitolite-admin and change every access rule. Keep this key off machines where AI agents run (see docs/identities.md)."
   fi
   mkdir -p "$(dirname "$dest")"
   cp "$key" "$dest"
@@ -1574,7 +1574,7 @@ warn_about_identities() {
         ;;
     esac
     if list_has "$admins" "$identity"; then
-      warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see README: Identities and keys)."
+      warn "'$identity' is also a gitolite-admin identity. Use a separate identity for daily work and agents, so their keys cannot change access rules (see docs/identities.md)."
     fi
     if [[ -z $(identity_key_files "$dir" "$identity") ]]; then
       warn "No key in keydir for '$identity'. Its rules have no effect until a key is added with user-add. Check the spelling."
@@ -2072,7 +2072,7 @@ require_admin_branch() {
   branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD) || \
     die "gitolite-admin has a detached HEAD. Run 'git switch $GITOLITE_ADMIN_BRANCH' first."
   [[ $branch == "$GITOLITE_ADMIN_BRANCH" ]] || \
-    die "gitolite-admin is on branch '$branch', but Gitolite only applies changes pushed to '$GITOLITE_ADMIN_BRANCH'. Switch to '$GITOLITE_ADMIN_BRANCH', or see 'Repair an admin repository on the wrong branch' in README.md."
+    die "gitolite-admin is on branch '$branch', but Gitolite only applies changes pushed to '$GITOLITE_ADMIN_BRANCH'. Switch to '$GITOLITE_ADMIN_BRANCH', or see 'Repair an admin repository on the wrong branch' in docs/administration.md."
 }
 
 # Fetch the admin branch from origin, then print how HEAD relates to it:

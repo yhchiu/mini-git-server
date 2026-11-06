@@ -2,33 +2,72 @@
 
 ## Checks
 
-Run the full local check before committing:
+There are three test suites. Which ones to run depends on what you change:
+
+| Suite | Command | Run it when you change | Needs | Where to run it |
+|---|---|---|---|---|
+| [Unit](#unit-tests) | `make check` | Anything; run it before every commit | Bash, Git; optional: `shellcheck`, `python3`, `curl`, `openssl` | Any machine |
+| [Integration](#integration-tests) | `sudo make test-integration` | Server commands, generated ACLs, anything that talks to Gitolite | root, `gitolite3`, `python3`, `curl` | A disposable machine or container |
+| [Install end-to-end](#install-end-to-end-test) | `MGS_E2E_DISPOSABLE=1 make test-install` | `install` | Debian 13, root | A throwaway container only |
+
+The suites are intentionally written in Bash and do not require Bats or
+another test framework. To run all three in a throwaway Debian 13
+container:
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -w /src debian:trixie bash -c '
+  apt-get update &&
+  apt-get install -y --no-install-recommends ca-certificates git make shellcheck openssh-client openssh-server gitolite3 python3 curl openssl &&
+  make check && make test-integration && MGS_E2E_DISPOSABLE=1 make test-install'
+```
+
+GitHub Actions runs the unit and integration tests on Ubuntu (the
+integration tests in a separate `integration` job), and all three suites in
+the `debian-13` job.
+
+### Unit tests
 
 ```bash
 make check
 ```
 
-The test suite is intentionally written in Bash and does not require Bats or another test framework. `shellcheck` is optional locally; GitHub Actions installs it in CI. The `share` tests need `python3` and `curl` (and `openssl` for `--tls`); without them they are skipped locally, but CI always runs them.
+`make check` runs `bash -n` on every shell file, ShellCheck when it is
+installed, and the unit tests (`make test` runs only the tests).
+`shellcheck` is optional locally; GitHub Actions installs it in CI. The
+`share` tests need `python3` and `curl` (and `openssl` for `--tls`); without
+them they are reported as skipped locally, but CI always runs them.
 
-Changes to server commands, generated ACLs, or anything that talks to Gitolite should also pass the integration tests. They need root, the `gitolite3` package, `python3` and `curl`, so run them on a disposable machine or container:
+### Integration tests
 
 ```bash
 sudo make test-integration
 ```
 
-GitHub Actions runs them in a separate `integration` job.
+The integration tests run against a real Gitolite installation. They create
+a temporary hosting account and remove it afterwards. They do not start
+sshd or change the SSH configuration: `tests/fake-ssh` runs each key's
+forced command from the Gitolite `authorized_keys` file, the same way sshd
+would. They cover installation with `--default-branch`, the admin workflow,
+the generated ACL (with real pushes), `status`, `doctor`, `fsck` and
+`backup`. Run them on a disposable machine or container rather than a
+production Git server.
 
-Changes to `install` should also pass the install end-to-end test. It runs
-the real `install` and changes the system, so run it only in a throwaway
-Debian 13 container (see "Testing" in the README for a `docker run`
-command):
+### Install end-to-end test
 
 ```bash
 MGS_E2E_DISPOSABLE=1 make test-install
 ```
 
-GitHub Actions runs it, together with the other suites, in the `debian-13`
-job.
+It runs the real `install` on Debian 13, then starts sshd and checks the
+result over real SSH connections: host keys, Git protocol v2, the admin
+workflow, access rules, `doctor`, `status` and `backup`. It also checks that
+a second `install` is refused without changing anything.
+
+> [!CAUTION]
+> This test installs packages, creates the `git` account and changes
+> `/etc/ssh`. It refuses to run unless `MGS_E2E_DISPOSABLE=1` is set. Run it
+> only in a throwaway container, for example with the `docker run` command
+> above.
 
 ## Writing tests
 
@@ -48,8 +87,15 @@ the test and marks it as failed, so a plain check such as
 When a change needs manual steps on existing installations (server settings,
 the `gitolite-admin` layout, or commands that now behave differently),
 describe them in `docs/upgrade/<next-version>.md` and add a row to the
-"Upgrade notes" table in the README. Keep the README upgrade section limited
-to the general steps that apply to every version.
+"Upgrade notes" table in [docs/upgrade/README.md](docs/upgrade/README.md).
+Keep that page limited to the general steps that apply to every version.
+
+## Documentation
+
+The README is the entry point: what the project is, a quick start, the
+command overview and links. Keep it short; put details in the topic pages
+under `docs/`. When you add a command or option, update the command table
+in the README, the topic page, and the `--help` text in the script.
 
 ## Design constraints
 
