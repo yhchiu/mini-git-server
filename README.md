@@ -1,5 +1,7 @@
 # mini-git-server
 
+**English** | [繁體中文](README.zh-TW.md)
+
 A single Bash script that turns a fresh Debian 13 host into a private Git
 server for people **and AI agents**, using only OpenSSH, Git and Gitolite 3
 from Debian.

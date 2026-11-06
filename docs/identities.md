@@ -1,5 +1,7 @@
 # Identities and keys
 
+**English** | [繁體中文](zh-TW/identities.md)
+
 Gitolite decides who you are only from the SSH key that connects. Any process
 that can use a key **is** that identity. The server-side access rules
 therefore protect you only as far as the keys are kept apart on the client

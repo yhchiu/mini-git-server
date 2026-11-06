@@ -1,5 +1,7 @@
 # Server operations
 
+**English** | [繁體中文](zh-TW/operations.md)
+
 These commands run on the Git server, as root.
 
 - [Health checks](#health-checks)

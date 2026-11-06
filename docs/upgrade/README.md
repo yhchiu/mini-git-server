@@ -1,5 +1,7 @@
 # Upgrading
 
+**English** | [繁體中文](../zh-TW/upgrade.md)
+
 Upgrading replaces the script. It never changes access rules by itself:
 existing keys and repository ACLs keep working, and Gitolite itself is not
 touched. When a new version needs changes on the server or in

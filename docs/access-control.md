@@ -1,5 +1,7 @@
 # Access control
 
+**English** | [繁體中文](zh-TW/access-control.md)
+
 These commands run inside a `gitolite-admin` working tree on an admin
 workstation. They only **stage** changes; run
 [`apply`](administration.md#apply-administrative-changes) to deploy them.

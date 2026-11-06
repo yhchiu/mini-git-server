@@ -97,6 +97,13 @@ command overview and links. Keep it short; put details in the topic pages
 under `docs/`. When you add a command or option, update the command table
 in the README, the topic page, and the `--help` text in the script.
 
+The README and the topic pages have Traditional Chinese translations:
+`README.zh-TW.md` and `docs/zh-TW/`. When you change an English page,
+update its translation in the same change, or say in the pull request that
+it still needs updating. Commands, options and program output stay in
+English in the translations. The per-version upgrade notes and this file
+are English only.
+
 ## Design constraints
 
 Keep the project small and conservative:

@@ -1,5 +1,7 @@
 # Installation
 
+**English** | [繁體中文](zh-TW/install.md)
+
 This page covers the first-time setup in detail. For the short version, see
 the [Quick start](../README.md#quick-start).
 

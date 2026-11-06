@@ -1,5 +1,7 @@
 # One-off deploys with `share`
 
+**English** | [繁體中文](zh-TW/share.md)
+
 A machine that needs the code only once, for example for a one-off deploy,
 does not need a key of its own. Run `share` on a machine that can read the
 repository, such as your workstation, and run the command it prints on the

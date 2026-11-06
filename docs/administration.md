@@ -1,5 +1,7 @@
 # Administration workflow
 
+**English** | [繁體中文](zh-TW/administration.md)
+
 All access rules live in the `gitolite-admin` repository. mini-git-server
 commands edit a working tree of it on an admin workstation and **stage**
 the changes; nothing reaches the server until `apply` commits and pushes

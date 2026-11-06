@@ -1,5 +1,7 @@
 # Working with AI agents
 
+**English** | [繁體中文](zh-TW/agents.md)
+
 Each agent gets its own SSH identity and, by default, can push only to its
 own `agent/<name>/*` branches. Gitolite enforces this on the server, rather
 than relying only on agent instructions.
