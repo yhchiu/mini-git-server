@@ -39,7 +39,8 @@ Server commands (run on the Git server):
   host-keys       Print SSH host key fingerprints and known_hosts lines
   ssh-limits      Show or set how many SSH logins sshd accepts at once
 
-Admin-workstation commands (run inside or against a gitolite-admin clone):
+Admin-workstation commands (run on the workstation, before or inside a gitolite-admin clone):
+  remote-install  Create the admin key, install a fresh server, and configure SSH here
   admin-clone     Clone gitolite-admin from the server
   admin-init      Enable script-managed per-repository config fragments
   user-add        Add an SSH public key to gitolite-admin/keydir
@@ -1171,6 +1172,571 @@ server_repo_set_default() {
 
   runuser -u "$git_user" -- git -C "$path" symbolic-ref HEAD "refs/heads/$branch"
   log "Default branch for '$repo' is now '$branch'."
+}
+
+remote_install_usage() {
+  cat <<'USAGE'
+Usage:
+  mini-git-server.sh remote-install --host HOST --admin-name NAME [options]
+
+From the workstation, do the first-time setup in one command:
+  1. Create a dedicated admin key (default: ~/.ssh/gitolite-admin).
+  2. Copy this script to a fresh Debian 13 server and run 'install' there.
+  3. Write known_hosts lines and SSH host aliases on this workstation.
+
+You need an SSH login to the server that is root, or can run 'sudo -n'.
+The server must not already be running Gitolite. To do the steps by hand,
+see docs/install.md.
+
+Required:
+  --host HOST              Name or IPv4 address clients use for the server
+  --admin-name NAME        Gitolite admin identity (for example arthur-admin)
+
+Login (how this workstation reaches the server before Gitolite exists):
+  --login-user USER        Unix account to SSH as (default: root)
+  --login-port PORT        SSH port of that login (default: 22)
+  --login-identity FILE    Private key for that login (default: ssh's own choice)
+
+Admin key, created only when --admin-key does not already exist:
+  --admin-key FILE         Private key path (default: ~/.ssh/gitolite-admin)
+  --key-type TYPE          ed25519-sk (default) or ed25519
+  --no-passphrase          Create the key with an empty passphrase.
+                           Otherwise ssh-keygen asks, which needs a terminal.
+
+Passed through to install:
+  --git-user USER          Hosting account (default: git)
+  --ssh-port PORT          Port sshd should listen on (default: 22)
+  --default-branch NAME    Git default branch for new repositories
+  --max-startups VALUE     sshd MaxStartups (see ssh-limits --help)
+  --no-ssh-hardening       Do not install the Match User drop-in
+
+Files written on this workstation:
+  --admin-alias NAME       SSH alias for the admin key (default: internal-git-admin)
+  --daily-alias NAME       SSH alias for the daily key (default: internal-git)
+  --daily-identity FILE    Daily private key (default: ~/.ssh/id_ed25519)
+  --ssh-config FILE        SSH config to update (default: ~/.ssh/config)
+  --known-hosts FILE       known_hosts file to update (default: ~/.ssh/known_hosts)
+
+The first connection pins the server host key (StrictHostKeyChecking=accept-new).
+When --ssh-port differs from --login-port, sshd is reloaded onto --ssh-port.
+This command does not change the firewall. After a successful install it
+connects once as the hosting user to confirm that port answers.
+
+On success the script is left at /usr/local/sbin/mini-git-server.sh on the
+server. An existing admin key is reused. An existing SSH alias is left as it is.
+
+Example:
+  mini-git-server.sh remote-install \
+    --host git.example.internal \
+    --admin-name arthur-admin \
+    --ssh-port 2222 \
+    --default-branch trunk
+USAGE
+}
+
+# Turn PATH into an absolute path and create its parent directory when missing.
+# ~/.ssh is created mode 0700; other directories keep mkdir's mode.
+remote_install_abs_path() {
+  local path=$1 dir base physical home_ssh
+  [[ $path == /* ]] || path="$PWD/$path"
+  dir=$(dirname -- "$path")
+  base=$(basename -- "$path")
+  if [[ ! -d $dir ]]; then
+    mkdir -p -- "$dir" || die "Cannot create directory: $dir"
+    if [[ -n ${HOME:-} && -d $HOME ]]; then
+      home_ssh=$(cd -- "$HOME" && pwd -P)/.ssh
+      physical=$(cd -- "$dir" && pwd -P)
+      [[ $physical != "$home_ssh" ]] || chmod 700 -- "$physical"
+    fi
+  fi
+  dir=$(cd -- "$dir" && pwd -P) || die "Cannot use directory: $dir"
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+# SSH config values are written with printf, so reject characters that would
+# make a value split, comment out the rest of the line, or expand later.
+remote_install_config_path() {
+  local label=$1 path=$2 without_backslash
+  [[ $path == /* ]] || die "$label must be an absolute path: $path"
+  # ${var//\\/} deletes backslashes. A shorter result means one was present.
+  without_backslash=${path//\\/}
+  if [[ $path == *[[:space:]]* || $path == *'#'* || $path == *'"'* || \
+        $path == *'$'* || $path == *'`'* || $without_backslash != "$path" ]]; then
+    die "$label contains characters that SSH config cannot store safely: $path"
+  fi
+}
+
+remote_install_validate_alias() {
+  local alias=$1
+  [[ $alias =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid SSH alias: $alias"
+}
+
+remote_install_validate_host() {
+  local host=$1
+  [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || \
+    die "Invalid --host: $host (use a hostname or an IPv4 address)"
+}
+
+# Print "yes" when FILE has a Host entry whose name is exactly ALIAS.
+remote_install_ssh_config_has_host() {
+  local file=$1 alias=$2 found
+  [[ -f $file ]] || return 1
+  found=$(awk -v alias="$alias" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (tolower(line) !~ /^host[[:space:]]/) next
+      sub(/^[Hh][Oo][Ss][Tt][[:space:]]+/, "", line)
+      n = split(line, tokens, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        gsub(/^"|"$/, "", tokens[i])
+        if (tokens[i] == alias) found = "yes"
+      }
+    }
+    END { print found }
+  ' "$file")
+  [[ $found == yes ]]
+}
+
+remote_install_ensure_key() {
+  local key=$1 key_type=$2 no_passphrase=$3
+  local pub="$key.pub" actual
+  case "$key_type" in
+    ed25519|ed25519-sk) ;;
+    *) die "Unsupported --key-type: $key_type (use ed25519-sk or ed25519)" ;;
+  esac
+  if [[ -e $key || -e $pub ]]; then
+    [[ -f $key && -f $pub ]] || \
+      die "Admin key is incomplete. Need both $key and $pub, or neither."
+    validate_pubkey "$pub"
+    actual=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "$pub")
+    case "$key_type:$actual" in
+      ed25519:ssh-ed25519|ed25519-sk:sk-ssh-ed25519@openssh.com) ;;
+      *) warn "Existing admin key is ${actual:-unknown}, not $key_type. Reusing $key." ;;
+    esac
+    log "Using existing admin key: $key"
+    return 0
+  fi
+  if (( ! no_passphrase )) && [[ ! -t 0 ]]; then
+    die "Creating $key needs a terminal so ssh-keygen can ask for a passphrase. Pass --no-passphrase to leave the passphrase empty."
+  fi
+  need_cmd ssh-keygen
+  log "Creating admin key ($key_type): $key"
+  local -a args=(-t "$key_type" -f "$key" -C gitolite-admin)
+  if (( no_passphrase )); then
+    args+=(-N "")
+  fi
+  if ! ssh-keygen "${args[@]}"; then
+    rm -f -- "$key" "$pub"
+    if [[ $key_type == ed25519-sk ]]; then
+      die "Could not create a FIDO2 admin key at $key. Without a security key, run again with --key-type ed25519."
+    fi
+    die "Could not create the admin key: $key"
+  fi
+  [[ -s $pub ]] || die "ssh-keygen did not write $pub"
+  validate_pubkey "$pub"
+}
+
+# ssh options are the arguments after PORT USER@HOST COMMAND.
+remote_install_ssh() {
+  local port=$1 userhost=$2 remote_cmd=$3
+  shift 3
+  ssh "$@" -p "$port" "$userhost" "$remote_cmd"
+}
+
+# Script executed on the server over the login SSH session. Keeping install
+# and the copy of this script in one session matters: install may reload sshd
+# onto another port, and this session stays up across that reload.
+remote_install_payload() {
+  cat <<'REMOTE'
+set -Eeuo pipefail
+IFS=$'\n\t'
+remote_dir=$1
+git_port=$2
+client_host=$3
+shift 3
+
+if [[ $(id -u) -ne 0 ]] && ! sudo -n true; then
+  printf '[ERROR] This account is not root, and sudo -n failed. Log in as root, or allow passwordless sudo for the installer.\n' >&2
+  exit 1
+fi
+
+as_root() {
+  if [[ $(id -u) -eq 0 ]]; then
+    "$@"
+  else
+    sudo -n -- "$@"
+  fi
+}
+
+cleanup() {
+  rm -rf -- "$remote_dir"
+}
+trap cleanup EXIT
+
+rc=0
+as_root bash "$remote_dir/mini-git-server.sh" install "$@" >&2 || rc=$?
+as_root install -D -m 0755 "$remote_dir/mini-git-server.sh" /usr/local/sbin/mini-git-server.sh >&2 || \
+  printf '[WARN] Could not copy the script to /usr/local/sbin/mini-git-server.sh\n' >&2
+printf '%s\n' '---MGS-KNOWN-HOSTS---'
+if (( rc == 0 )); then
+  as_root bash "$remote_dir/mini-git-server.sh" host-keys --host "$client_host" --port "$git_port" || rc=$?
+fi
+exit "$rc"
+REMOTE
+}
+
+remote_install_expected_marker() {
+  local host=$1 port=$2
+  if [[ $port == 22 ]]; then
+    printf '%s\n' "$host"
+  else
+    printf '[%s]:%s\n' "$host" "$port"
+  fi
+}
+
+# Read host-keys output from stdin. Print only known_hosts lines for the
+# host marker the workstation will use. A line for any other host is refused,
+# so a confused or hostile server cannot append unrelated keys.
+remote_install_extract_keys() {
+  local expected=$1 line section=0 count=0 rest
+  local -a lines=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == '---MGS-KNOWN-HOSTS---' ]]; then
+      section=1
+      continue
+    fi
+    [[ $section -eq 1 ]] || continue
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^[^[:space:]]+[[:space:]]+(ssh-|sk-|ecdsa-)[^[:space:]]+[[:space:]]+[^[:space:]]+$ ]]; then
+      # The marker is matched as a literal prefix. Quoting it keeps '[' in
+      # a non-standard port marker from being a glob.
+      if [[ $line != "$expected "* ]]; then
+        printf '[ERROR] Refusing a known_hosts line for an unexpected host: %s\n' "$line" >&2
+        return 1
+      fi
+      rest=${line#"$expected "}
+      if [[ ! $rest =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+$ ]]; then
+        printf '[ERROR] Refusing a malformed known_hosts line: %s\n' "$line" >&2
+        return 1
+      fi
+      lines+=("$line")
+      count=$((count + 1))
+    fi
+  done
+  if (( count < 1 || count > 10 )); then
+    printf '[ERROR] Expected 1 to 10 SSH host key lines for %s, got %s.\n' "$expected" "$count" >&2
+    return 1
+  fi
+  printf '%s\n' "${lines[@]}"
+}
+
+# Merge key lines on stdin into FILE. An identical line is kept once. A
+# different key for the same host and type stops the command; the file is
+# left unchanged.
+remote_install_merge_known_hosts() {
+  local file=$1 line marker keytype existing tmp
+  tmp=$(mktemp "$(dirname -- "$file")/known_hosts.XXXXXX")
+  if [[ -f $file ]]; then
+    cat -- "$file" >"$tmp"
+    # cat would glue the next key onto a file that does not end in a newline.
+    if [[ -s $tmp && -n $(tail -c1 -- "$tmp") ]]; then
+      printf '\n' >>"$tmp"
+    fi
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line ]] || continue
+    marker=${line%% *}
+    keytype=${line#* }
+    keytype=${keytype%% *}
+    existing=$(awk -v m="$marker" -v t="$keytype" '$1 == m && $2 == t { print; exit }' "$tmp")
+    if [[ -n $existing && $existing == "$line" ]]; then
+      continue
+    fi
+    if [[ -n $existing ]]; then
+      rm -f -- "$tmp"
+      printf '[ERROR] %s already has a different %s key for %s.\n' "$file" "$keytype" "$marker" >&2
+      return 1
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+  done
+  if [[ -f $file ]]; then
+    chmod --reference="$file" -- "$tmp" || chmod 0644 -- "$tmp"
+  else
+    chmod 0644 -- "$tmp"
+  fi
+  mv -f -- "$tmp" "$file"
+}
+
+remote_install_ssh_block() {
+  local host=$1 git_user=$2 port=$3 known=$4
+  local admin_alias=$5 admin_key=$6 daily_alias=$7 daily_key=$8
+  printf '# BEGIN mini-git-server (%s)\n' "$host"
+  printf 'Host %s\n' "$admin_alias"
+  printf '    HostName %s\n' "$host"
+  printf '    User %s\n' "$git_user"
+  printf '    Port %s\n' "$port"
+  printf '    IdentityFile %s\n' "$admin_key"
+  printf '    IdentitiesOnly yes\n'
+  printf '    IdentityAgent none\n'
+  printf '    UserKnownHostsFile %s\n' "$known"
+  printf '    StrictHostKeyChecking yes\n'
+  printf '\n'
+  printf 'Host %s\n' "$daily_alias"
+  printf '    HostName %s\n' "$host"
+  printf '    User %s\n' "$git_user"
+  printf '    Port %s\n' "$port"
+  printf '    IdentityFile %s\n' "$daily_key"
+  printf '    IdentitiesOnly yes\n'
+  printf '    UserKnownHostsFile %s\n' "$known"
+  printf '    StrictHostKeyChecking yes\n'
+  printf '# END mini-git-server (%s)\n' "$host"
+}
+
+# Prepend the block on stdin to FILE so it wins over a later "Host *".
+remote_install_write_ssh_config() {
+  local file=$1 block tmp
+  block=$(cat)
+  tmp=$(mktemp "$(dirname -- "$file")/config.XXXXXX")
+  printf '%s\n' "$block" >"$tmp"
+  if [[ -s $file ]]; then
+    printf '\n' >>"$tmp"
+    cat -- "$file" >>"$tmp"
+  fi
+  if [[ -f $file ]]; then
+    chmod --reference="$file" -- "$tmp" || chmod 0600 -- "$tmp"
+  else
+    chmod 0600 -- "$tmp"
+  fi
+  mv -f -- "$tmp" "$file"
+}
+
+remote_install_fail() {
+  local message=$1 path
+  shift
+  for path in "$@"; do
+    [[ -n $path ]] && rm -f -- "$path"
+  done
+  die "$message"
+}
+
+remote_install() {
+  local host="" admin_name=""
+  local login_user=root login_port=$DEFAULT_SSH_PORT login_identity=""
+  local admin_key="" key_type=ed25519-sk no_passphrase=0
+  local git_user=$DEFAULT_GIT_USER ssh_port=$DEFAULT_SSH_PORT
+  local default_branch="" max_startups="" harden=1
+  local admin_alias=internal-git-admin daily_alias=internal-git daily_identity=""
+  local ssh_config="" known_hosts=""
+
+  while (($#)); do
+    case "$1" in
+      --host) [[ $# -ge 2 ]] || die "--host requires a value"; host=$2; shift 2 ;;
+      --admin-name) [[ $# -ge 2 ]] || die "--admin-name requires a value"; admin_name=$2; shift 2 ;;
+      --login-user) [[ $# -ge 2 ]] || die "--login-user requires a value"; login_user=$2; shift 2 ;;
+      --login-port) [[ $# -ge 2 ]] || die "--login-port requires a value"; login_port=$2; shift 2 ;;
+      --login-identity) [[ $# -ge 2 ]] || die "--login-identity requires a value"; login_identity=$2; shift 2 ;;
+      --admin-key) [[ $# -ge 2 ]] || die "--admin-key requires a value"; admin_key=$2; shift 2 ;;
+      --key-type) [[ $# -ge 2 ]] || die "--key-type requires a value"; key_type=$2; shift 2 ;;
+      --no-passphrase) no_passphrase=1; shift ;;
+      --git-user) [[ $# -ge 2 ]] || die "--git-user requires a value"; git_user=$2; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || die "--ssh-port requires a value"; ssh_port=$2; shift 2 ;;
+      --default-branch) [[ $# -ge 2 ]] || die "--default-branch requires a value"; default_branch=$2; shift 2 ;;
+      --max-startups) [[ $# -ge 2 ]] || die "--max-startups requires a value"; max_startups=$2; shift 2 ;;
+      --no-ssh-hardening) harden=0; shift ;;
+      --admin-alias) [[ $# -ge 2 ]] || die "--admin-alias requires a value"; admin_alias=$2; shift 2 ;;
+      --daily-alias) [[ $# -ge 2 ]] || die "--daily-alias requires a value"; daily_alias=$2; shift 2 ;;
+      --daily-identity) [[ $# -ge 2 ]] || die "--daily-identity requires a value"; daily_identity=$2; shift 2 ;;
+      --ssh-config) [[ $# -ge 2 ]] || die "--ssh-config requires a value"; ssh_config=$2; shift 2 ;;
+      --known-hosts) [[ $# -ge 2 ]] || die "--known-hosts requires a value"; known_hosts=$2; shift 2 ;;
+      -h|--help) remote_install_usage; return 0 ;;
+      *) die "Unknown remote-install option: $1" ;;
+    esac
+  done
+
+  [[ -n $host ]] || die "--host is required"
+  [[ -n $admin_name ]] || die "--admin-name is required"
+  remote_install_validate_host "$host"
+  validate_simple_name "$admin_name" "Admin name"
+  validate_unix_user "$login_user"
+  validate_unix_user "$git_user"
+  validate_port "$login_port"
+  validate_port "$ssh_port"
+  [[ -z $default_branch ]] || validate_branch_name "$default_branch"
+  [[ -z $max_startups ]] || validate_max_startups "$max_startups"
+  remote_install_validate_alias "$admin_alias"
+  remote_install_validate_alias "$daily_alias"
+  [[ $admin_alias != "$daily_alias" ]] || \
+    die "The admin alias and the daily alias are both '$admin_alias'. Choose two different names."
+  case "$key_type" in
+    ed25519|ed25519-sk) ;;
+    *) die "Unsupported --key-type: $key_type (use ed25519-sk or ed25519)" ;;
+  esac
+
+  if [[ -z $admin_key || -z $daily_identity || -z $ssh_config || -z $known_hosts ]]; then
+    [[ -n ${HOME:-} ]] || \
+      die "HOME is not set. Pass --admin-key, --daily-identity, --ssh-config and --known-hosts."
+  fi
+  [[ -n $admin_key ]] || admin_key="$HOME/.ssh/gitolite-admin"
+  [[ -n $daily_identity ]] || daily_identity="$HOME/.ssh/id_ed25519"
+  [[ -n $ssh_config ]] || ssh_config="$HOME/.ssh/config"
+  [[ -n $known_hosts ]] || known_hosts="$HOME/.ssh/known_hosts"
+
+  admin_key=$(remote_install_abs_path "$admin_key")
+  daily_identity=$(remote_install_abs_path "$daily_identity")
+  ssh_config=$(remote_install_abs_path "$ssh_config")
+  known_hosts=$(remote_install_abs_path "$known_hosts")
+  remote_install_config_path "Admin key" "$admin_key"
+  remote_install_config_path "Daily key" "$daily_identity"
+  remote_install_config_path "SSH config" "$ssh_config"
+  remote_install_config_path "known_hosts file" "$known_hosts"
+  if [[ -n $login_identity ]]; then
+    [[ -f $login_identity ]] || die "Login identity not found: $login_identity"
+    login_identity=$(remote_install_abs_path "$login_identity")
+  fi
+
+  local begin_marker="# BEGIN mini-git-server ($host)" taken_alias
+  if [[ -f $ssh_config ]] && grep -Fxq -- "$begin_marker" "$ssh_config"; then
+    die "SSH config $ssh_config already contains a remote-install block for $host. Edit that block by hand, or remove it and run this command again."
+  fi
+  for taken_alias in "$admin_alias" "$daily_alias"; do
+    if remote_install_ssh_config_has_host "$ssh_config" "$taken_alias"; then
+      die "SSH config $ssh_config already defines Host $taken_alias. Remove that entry or pass a different alias."
+    fi
+  done
+
+  if [[ $ssh_port != "$login_port" ]]; then
+    warn "sshd on $host will listen on port $ssh_port. This command does not change the firewall. Open port $ssh_port first if it is not already reachable."
+  fi
+  if [[ ! -f $daily_identity ]]; then
+    warn "Daily key $daily_identity is not there yet. Alias '$daily_alias' points at that path; create the key before using the alias."
+  fi
+
+  remote_install_ensure_key "$admin_key" "$key_type" "$no_passphrase"
+  local pub="$admin_key.pub"
+  need_cmd ssh
+
+  local script_path
+  script_path=${BASH_SOURCE[0]}
+  [[ -f $script_path ]] || die "Cannot find this script at $script_path"
+  script_path=$(remote_install_abs_path "$script_path")
+
+  local -a ssh_opts=(
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    -o HashKnownHosts=no
+    -o UpdateHostKeys=no
+    -o "UserKnownHostsFile=$known_hosts"
+    -o GlobalKnownHostsFile=/dev/null
+    -o ConnectTimeout=15
+  )
+  if [[ -n $login_identity ]]; then
+    ssh_opts+=(-o IdentitiesOnly=yes -i "$login_identity")
+  fi
+  local userhost="$login_user@$host"
+
+  local remote_dir
+  remote_dir=$(remote_install_ssh "$login_port" "$userhost" \
+    "mktemp -d '/tmp/mgs-remote-install.XXXXXXXX'" "${ssh_opts[@]}") || \
+    die "Could not create a temporary directory on $host"
+  remote_dir=${remote_dir//[[:space:]]/}
+  [[ $remote_dir =~ ^/tmp/mgs-remote-install\.[A-Za-z0-9]{8}$ ]] || \
+    die "Unexpected temporary directory from the server: $remote_dir"
+
+  log "Copying this script and the admin public key to $host"
+  if ! { remote_install_ssh "$login_port" "$userhost" \
+           "cat > $(printf '%q' "$remote_dir/mini-git-server.sh")" "${ssh_opts[@]}" < "$script_path" && \
+         remote_install_ssh "$login_port" "$userhost" \
+           "cat > $(printf '%q' "$remote_dir/admin.pub")" "${ssh_opts[@]}" < "$pub"; }; then
+    remote_install_ssh "$login_port" "$userhost" \
+      "rm -rf -- $(printf '%q' "$remote_dir")" "${ssh_opts[@]}" || true
+    die "Could not copy the installer to $host"
+  fi
+
+  local -a install_args=(
+    --admin-key "$remote_dir/admin.pub"
+    --admin-name "$admin_name"
+    --git-user "$git_user"
+    --ssh-port "$ssh_port"
+  )
+  [[ -z $default_branch ]] || install_args+=(--default-branch "$default_branch")
+  [[ -z $max_startups ]] || install_args+=(--max-startups "$max_startups")
+  (( harden )) || install_args+=(--no-ssh-hardening)
+
+  local remote_cmd payload_file output_file rc sentinel=0
+  printf -v remote_cmd '%q ' bash -s -- "$remote_dir" "$ssh_port" "$host" "${install_args[@]}"
+  payload_file=$(mktemp)
+  output_file=$(mktemp)
+  remote_install_payload >"$payload_file"
+  log "Installing on $host. Package installation can take a few minutes."
+  rc=0
+  remote_install_ssh "$login_port" "$userhost" "$remote_cmd" "${ssh_opts[@]}" \
+    <"$payload_file" >"$output_file" || rc=$?
+  if grep -qxF -- '---MGS-KNOWN-HOSTS---' "$output_file"; then
+    sentinel=1
+  fi
+  if (( rc != 0 || sentinel == 0 )); then
+    # The remote script removes its directory when it starts. A connection
+    # that never got that far leaves the directory on the login port.
+    if (( sentinel == 0 )); then
+      remote_install_ssh "$login_port" "$userhost" \
+        "rm -rf -- $(printf '%q' "$remote_dir")" "${ssh_opts[@]}" || true
+    fi
+    cat -- "$output_file" >&2 || true
+    remote_install_fail "Remote install failed." "$output_file" "$payload_file"
+  fi
+  rm -f -- "$payload_file"
+  payload_file=""
+  awk '$0 != "---MGS-KNOWN-HOSTS---" { print }' "$output_file"
+
+  local expected lines
+  expected=$(remote_install_expected_marker "$host" "$ssh_port")
+  if ! lines=$(remote_install_extract_keys "$expected" <"$output_file"); then
+    remote_install_fail "Could not read SSH host keys from the server." "$output_file"
+  fi
+  rm -f -- "$output_file"
+  output_file=""
+  if ! printf '%s\n' "$lines" | remote_install_merge_known_hosts "$known_hosts"; then
+    remote_install_fail "SSH host keys were not written. The server install already finished; copy the host keys by hand if you still trust them (see docs/install.md)."
+  fi
+  log "Updated $known_hosts"
+
+  if ! remote_install_ssh_block "$host" "$git_user" "$ssh_port" "$known_hosts" \
+         "$admin_alias" "$admin_key" "$daily_alias" "$daily_identity" \
+       | remote_install_write_ssh_config "$ssh_config"; then
+    die "SSH config was not written. known_hosts was updated at $known_hosts."
+  fi
+  log "Updated $ssh_config"
+
+  log "Checking SSH access as $git_user on port $ssh_port"
+  if ! ssh -F "$ssh_config" \
+      -o BatchMode=yes \
+      -o StrictHostKeyChecking=yes \
+      -o "UserKnownHostsFile=$known_hosts" \
+      -o GlobalKnownHostsFile=/dev/null \
+      -o ConnectTimeout=15 \
+      -o IdentitiesOnly=yes \
+      "$admin_alias" info
+  then
+    die "The server is installed and $ssh_config was updated, but $admin_alias did not answer on port $ssh_port. Open that port if a firewall blocks it, then run: ssh $admin_alias info"
+  fi
+
+  cat <<EOF
+
+Workstation summary
+  Admin key     : $admin_key
+  SSH config    : $ssh_config
+  known_hosts   : $known_hosts
+  Admin alias   : $admin_alias
+  Daily alias   : $daily_alias
+  Server script : /usr/local/sbin/mini-git-server.sh
+
+Next, on this workstation:
+  git clone ${admin_alias}:gitolite-admin
+  cd gitolite-admin
+  $script_path admin-init
+
+EOF
 }
 
 admin_clone_usage() {
@@ -2750,6 +3316,7 @@ main() {
     repo-set-default) server_repo_set_default "$@" ;;
     host-keys)    server_host_keys "$@" ;;
     ssh-limits)   server_ssh_limits "$@" ;;
+    remote-install) remote_install "$@" ;;
     admin-clone)  admin_clone "$@" ;;
     admin-init)   admin_init "$@" ;;
     user-add)     user_add "$@" ;;

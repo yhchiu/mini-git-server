@@ -2,7 +2,8 @@
 
 **English** | [繁體中文](zh-TW/operations.md)
 
-These commands run on the Git server, as root.
+These commands run on the Git server, as root. `remote-install` leaves the
+script at `/usr/local/sbin/mini-git-server.sh`, which is on root's PATH.
 
 - [Health checks](#health-checks)
 - [Backup](#backup)

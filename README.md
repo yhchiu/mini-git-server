@@ -31,54 +31,64 @@ from Debian.
 
 ## Quick start
 
-You need a fresh Debian 13 server and an admin workstation with OpenSSH and
-Git. Details for every step are in [Installation](docs/install.md).
+You need a fresh Debian 13 server and a workstation with OpenSSH and Git.
 
-**1. Create a dedicated admin key** on the workstation. A FIDO2 security key
-(`ed25519-sk`) is recommended; without one, use `-t ed25519` with a
-passphrase.
+### 1. Install the server remotely
 
-```bash
-ssh-keygen -t ed25519-sk -f ~/.ssh/gitolite-admin -C gitolite-admin
-```
-
-**2. Install the server.** Copy `mini-git-server.sh` and
-`gitolite-admin.pub` to the server, then:
+`remote-install` runs on the workstation and does the first three steps of
+the [manual installation](docs/install.md): it creates the admin key,
+installs a fresh Debian 13 server, and writes `known_hosts` and SSH aliases
+on this machine.
 
 ```bash
-sudo ./mini-git-server.sh install \
-  --admin-key ./gitolite-admin.pub \
+./mini-git-server.sh remote-install \
+  --host git.example.internal \
   --admin-name arthur-admin \
   --ssh-port 2222 \
   --default-branch trunk
 ```
 
-> [!IMPORTANT]
-> The script does not change any firewall. If you use a non-default SSH
-> port, make sure it is reachable before you end your current session.
+The workstation must already be able to SSH to the server. The default login
+is `root` on port 22, using whatever keys SSH would normally try. Pass
+`--login-user`, `--login-port` and `--login-identity` when that login is
+different. A user other than root must be able to run `sudo -n` (passwordless
+sudo).
 
-**3. Configure the workstation.** Add the `known_hosts` lines that `install`
-printed to `~/.ssh/known_hosts`, and one SSH host alias per identity:
+| Option | Default | Purpose |
+|---|---|---|
+| `--host` | required | Name or IPv4 address clients use for the server |
+| `--admin-name` | required | Gitolite admin identity, for example `arthur-admin` |
+| `--login-user` | `root` | Unix account used to SSH in and run `install` |
+| `--login-port` | `22` | SSH port of that login |
+| `--login-identity` | SSH's own choice | Private key for that login |
+| `--admin-key` | `~/.ssh/gitolite-admin` | Admin private key to create or reuse |
+| `--key-type` | `ed25519-sk` | `ed25519-sk` or `ed25519`; used only when creating the key |
+| `--no-passphrase` | prompt | Create the key with an empty passphrase |
+| `--git-user` | `git` | Hosting account, passed through to `install` |
+| `--ssh-port` | `22` | Port sshd should listen on after installation |
+| `--default-branch` | unchanged | Git default branch for new repositories |
+| `--admin-alias` | `internal-git-admin` | SSH alias for the admin key |
+| `--daily-alias` | `internal-git` | SSH alias for the daily key |
+| `--daily-identity` | `~/.ssh/id_ed25519` | Daily private key the daily alias points at |
+| `--ssh-config` | `~/.ssh/config` | SSH config file to update |
+| `--known-hosts` | `~/.ssh/known_hosts` | `known_hosts` file to update |
 
-```sshconfig
-# Admin key, used only for gitolite-admin
-Host internal-git-admin
-    HostName git.example.internal
-    User git
-    Port 2222
-    IdentityFile ~/.ssh/gitolite-admin
-    IdentitiesOnly yes
+`remote-install --help` lists every option, including `--max-startups` and
+`--no-ssh-hardening`.
 
-# Your daily key
-Host internal-git
-    HostName git.example.internal
-    User git
-    Port 2222
-    IdentityFile ~/.ssh/id_ed25519
-    IdentitiesOnly yes
-```
+The first connection pins the server host key
+(`StrictHostKeyChecking=accept-new`). When `--ssh-port` differs from
+`--login-port`, sshd is reloaded onto `--ssh-port`. The command does not
+change the firewall. After install it connects once as the hosting user; if
+that port does not answer, the workstation files are already written and the
+command stops so you can open the port and retry `ssh <admin-alias> info`.
 
-**4. Clone and prepare `gitolite-admin`:**
+On success the script is left at `/usr/local/sbin/mini-git-server.sh` on the
+server. An existing admin key is reused. An existing SSH alias is left as it
+is. `remote-install` does not clone `gitolite-admin` or add users; that is
+the next step below.
+
+**2. Clone and prepare `gitolite-admin`:**
 
 ```bash
 git clone internal-git-admin:gitolite-admin
@@ -86,7 +96,7 @@ cd gitolite-admin
 /path/to/mini-git-server.sh admin-init
 ```
 
-**5. Add users, agents and a repository.** These commands only stage
+**3. Add users, agents and a repository.** These commands only stage
 changes:
 
 ```bash
@@ -100,7 +110,7 @@ changes:
   --protected-branch trunk
 ```
 
-**6. Review and deploy:**
+**4. Review and deploy:**
 
 ```bash
 /path/to/mini-git-server.sh apply -m "Add project-x"
@@ -141,6 +151,7 @@ Run `mini-git-server.sh help` for the full list, and
 | | `repo-set-default` | Set a repository's default branch (`HEAD`) |
 | | `host-keys` | Print SSH host key fingerprints and `known_hosts` lines |
 | | `ssh-limits` | Show or set sshd's `MaxStartups` |
+| Admin workstation | `remote-install` | Create the admin key, install a fresh server, and write SSH config |
 | Admin workstation (in `gitolite-admin`) | `admin-clone`, `admin-init` | Clone `gitolite-admin`; enable script-managed ACL fragments |
 | | `user-add`, `user-remove`, `user-list` | Manage SSH keys and identities |
 | | `repo-set`, `repo-show`, `repo-list` | Set and inspect repository ACLs (`repo-add` is an old alias of `repo-set`) |
@@ -154,7 +165,7 @@ Run `mini-git-server.sh help` for the full list, and
 
 | Guide | Contents |
 |---|---|
-| [Installation](docs/install.md) | Admin key, `install` options and what it changes, workstation SSH setup, host keys |
+| [Installation](docs/install.md) | Manual install: admin key, `install`, workstation SSH setup, host keys |
 | [Administration workflow](docs/administration.md) | `admin-init`, `apply`, `sync`, several admin machines, repairing the admin branch |
 | [Access control](docs/access-control.md) | Users and keys, `repo-set` and the generated ACL, groups, `repo-show`, default vs protected branch |
 | [Working with AI agents](docs/agents.md) | Agent workflow, `--agent-rewind`, reviewing and merging, recovering branches, many agents |

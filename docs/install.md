@@ -2,8 +2,9 @@
 
 **English** | [繁體中文](zh-TW/install.md)
 
-This page covers the first-time setup in detail. For the short version, see
-the [Quick start](../README.md#quick-start).
+This page is the manual installation. To do it from the workstation with
+`remote-install`, see
+[Install the server remotely](../README.md#1-install-the-server-remotely).
 
 - [1. Generate a dedicated admin key](#1-generate-a-dedicated-admin-key)
 - [2. Install the server](#2-install-the-server)

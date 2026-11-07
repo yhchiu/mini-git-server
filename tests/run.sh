@@ -1506,6 +1506,372 @@ test_share_tls_pins_the_certificate() {
   assert_eq '' "$(ls -A "$tmp/tmpdir")"
 }
 
+# Workstation-side stand-in for the server. Records every ssh command and
+# pretends that install printed host keys.
+prepare_remote_install_fake() {
+  local tmp=$1
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/keys" "$tmp/ssh"
+  cat >"$tmp/hostkeys.txt" <<'EOF'
+SSH host key fingerprints for git.example.internal:
+  256 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa git.example.internal (ED25519)
+
+known_hosts lines (replace git.example.internal with the name clients use, if different):
+[git.example.internal]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeEd25519KeyMaterialForUnitTestOnly
+[git.example.internal]:2222 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBFakeEcdsaKeyMaterialForUnitTestOnlyx
+EOF
+  cat >"$tmp/bin/ssh" <<'SH'
+#!/bin/sh
+set -eu
+if [ -z "${MGS_FAKE_DIR:-}" ]; then
+  echo "MGS_FAKE_DIR is not set" >&2
+  exit 1
+fi
+log=$MGS_FAKE_DIR/ssh.log
+{
+  printf 'CMD'
+  for arg in "$@"; do
+    printf ' [%s]' "$arg"
+  done
+  printf '\n'
+} >>"$log"
+cmd=""
+for arg in "$@"; do
+  cmd=$arg
+done
+case $cmd in
+  *mktemp*)
+    printf '%s\n' /tmp/mgs-remote-install.testdata
+    ;;
+  *'cat >'*)
+    path=${cmd##* }
+    base=${path##*/}
+    cat >"$MGS_FAKE_DIR/uploaded-$base"
+    ;;
+  *'bash -s'*)
+    cat >"$MGS_FAKE_DIR/remote-script.sh"
+    if [ -n "${MGS_FAKE_FAIL:-}" ]; then
+      exit 1
+    fi
+    printf '%s\n' '---MGS-KNOWN-HOSTS---'
+    cat "$MGS_FAKE_DIR/hostkeys.txt"
+    if [ -n "${MGS_FAKE_EXTRA:-}" ]; then
+      printf '%s\n' "$MGS_FAKE_EXTRA"
+    fi
+    ;;
+  *'rm -rf'*)
+    ;;
+  info)
+    if [ -n "${MGS_FAKE_PROBE_FAIL:-}" ]; then
+      echo "connection refused" >&2
+      exit 1
+    fi
+    printf '%s\n' 'hello arthur-admin'
+    ;;
+  *)
+    printf 'unexpected ssh command: %s\n' "$cmd" >&2
+    exit 2
+    ;;
+esac
+SH
+  chmod +x "$tmp/bin/ssh"
+}
+
+run_remote_install() {
+  local tmp=$1
+  shift
+  HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+    "$SCRIPT" remote-install \
+    --host git.example.internal \
+    --admin-name arthur-admin \
+    --admin-key "$tmp/keys/gitolite-admin" \
+    --ssh-port 2222 \
+    --default-branch trunk \
+    --max-startups 50:30:200 \
+    --no-ssh-hardening \
+    --ssh-config "$tmp/ssh/config" \
+    --known-hosts "$tmp/ssh/known_hosts" \
+    --daily-identity "$tmp/keys/id_ed25519" \
+    "$@"
+}
+
+test_remote_install_help_lists_the_command() {
+  local out
+  out=$("$SCRIPT" help)
+  assert_contains "$out" 'remote-install'
+  out=$("$SCRIPT" remote-install --help)
+  assert_contains "$out" '--host HOST'
+  assert_contains "$out" '--admin-name NAME'
+  assert_contains "$out" 'ed25519-sk'
+  assert_contains "$out" 'docs/install.md'
+}
+
+test_remote_install_rejects_bad_options_before_connecting() {
+  local tmp out dollar
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --admin-name arthur 2>&1); then
+    printf 'missing --host should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" '--host is required'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host git.example.internal 2>&1); then
+    printf 'missing --admin-name should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" '--admin-name is required'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host 'not a host' --admin-name arthur 2>&1); then
+    printf 'bad host should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'Invalid --host'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host git.example.internal --admin-name arthur --key-type rsa 2>&1); then
+    printf 'bad key type should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'ed25519'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host git.example.internal --admin-name arthur \
+      --admin-alias git --daily-alias git 2>&1); then
+    printf 'identical aliases should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'different names'
+  dollar='$'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host git.example.internal --admin-name arthur \
+      --admin-key "$tmp/keys/bad${dollar}key" --key-type ed25519 --no-passphrase \
+      --ssh-config "$tmp/ssh/config" --known-hosts "$tmp/ssh/known_hosts" \
+      --daily-identity "$tmp/keys/id_ed25519" 2>&1); then
+    printf 'unsafe path should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'cannot store safely'
+  if out=$(HOME="$tmp/home" MGS_FAKE_DIR="$tmp" PATH="$tmp/bin:$PATH" \
+      "$SCRIPT" remote-install --host git.example.internal --admin-name arthur \
+      --admin-key "$tmp/keys/bad\\key" --key-type ed25519 --no-passphrase \
+      --ssh-config "$tmp/ssh/config" --known-hosts "$tmp/ssh/known_hosts" \
+      --daily-identity "$tmp/keys/id_ed25519" 2>&1); then
+    printf 'backslash path should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'cannot store safely'
+  [[ ! -s $tmp/ssh.log ]]
+  [[ ! -e $tmp/keys/gitolite-admin ]]
+}
+
+test_remote_install_refuses_an_existing_alias() {
+  local tmp out
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  printf 'Host internal-git-admin\n    User git\n' >"$tmp/ssh/config"
+  if out=$(run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'existing alias should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'already defines Host internal-git-admin'
+  [[ ! -e $tmp/keys/gitolite-admin ]]
+  [[ ! -s $tmp/ssh.log ]]
+}
+
+test_remote_install_refuses_a_new_key_without_a_terminal() {
+  local tmp out
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  if out=$(run_remote_install "$tmp" --key-type ed25519 2>&1 </dev/null); then
+    printf 'missing passphrase prompt should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" '--no-passphrase'
+  [[ ! -e $tmp/keys/gitolite-admin ]]
+  [[ ! -s $tmp/ssh.log ]]
+}
+
+test_remote_install_known_hosts_marker() {
+  local marker
+  # shellcheck source=/dev/null
+  source "$SCRIPT"
+  marker=$(remote_install_expected_marker git.example.internal 22)
+  assert_eq 'git.example.internal' "$marker"
+  marker=$(remote_install_expected_marker git.example.internal 2222)
+  assert_eq '[git.example.internal]:2222' "$marker"
+}
+
+test_remote_install_prepares_the_workstation() {
+  local tmp out config known ed_line ecdsa_line identity daily
+  local admin_line daily_line other_line login_phys config_phys known_line probe again
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  ed_line=$(grep 'ssh-ed25519' "$tmp/hostkeys.txt")
+  ecdsa_line=$(grep 'ecdsa-sha2' "$tmp/hostkeys.txt")
+  printf '%s\n' "$ed_line" >"$tmp/ssh/known_hosts"
+  printf 'Host other\n    User bob\n' >"$tmp/ssh/config"
+  chmod 640 "$tmp/ssh/known_hosts" "$tmp/ssh/config"
+  ssh-keygen -q -t ed25519 -N '' -C login -f "$tmp/keys/login"
+  out=$(run_remote_install "$tmp" \
+    --key-type ed25519 --no-passphrase \
+    --login-user deploy --login-port 22 --login-identity "$tmp/keys/login" 2>&1)
+  assert_eq 'gitolite-admin' "$(awk '{ print $NF }' "$tmp/keys/gitolite-admin.pub")"
+  assert_eq 'ssh-ed25519' "$(awk '{ print $1; exit }' "$tmp/keys/gitolite-admin.pub")"
+  cmp -s "$SCRIPT" "$tmp/uploaded-mini-git-server.sh"
+  cmp -s "$tmp/keys/gitolite-admin.pub" "$tmp/uploaded-admin.pub"
+  bash -n "$tmp/remote-script.sh"
+  assert_contains "$(cat "$tmp/remote-script.sh")" 'sudo -n'
+  assert_contains "$(cat "$tmp/remote-script.sh")" '/usr/local/sbin/mini-git-server.sh'
+  assert_contains "$(cat "$tmp/remote-script.sh")" '---MGS-KNOWN-HOSTS---'
+  assert_contains "$(cat "$tmp/ssh.log")" '--admin-name arthur-admin'
+  assert_contains "$(cat "$tmp/ssh.log")" '--admin-key /tmp/mgs-remote-install.testdata/admin.pub'
+  assert_contains "$(cat "$tmp/ssh.log")" '--ssh-port 2222'
+  assert_contains "$(cat "$tmp/ssh.log")" '--default-branch trunk'
+  assert_contains "$(cat "$tmp/ssh.log")" '--max-startups 50:30:200'
+  assert_contains "$(cat "$tmp/ssh.log")" '--no-ssh-hardening'
+  assert_contains "$(cat "$tmp/ssh.log")" '--git-user git'
+  login_phys=$(cd "$tmp/keys" && pwd -P)/login
+  assert_contains "$(grep 'mktemp -d' "$tmp/ssh.log")" "deploy@git.example.internal"
+  assert_contains "$(grep 'mktemp -d' "$tmp/ssh.log")" "$login_phys"
+  assert_not_contains "$(cat "$tmp/ssh.log")" 'rm -rf'
+  awk '
+    /mktemp -d/ { if (!mk) mk = NR }
+    /cat > / { if (!up) up = NR }
+    /bash -s/ { if (!run) run = NR }
+    /\[info\]$/ { if (!probe) probe = NR }
+    END { exit !(mk && up && run && probe && mk < up && up < run && run < probe) }
+  ' "$tmp/ssh.log"
+  config="$tmp/ssh/config"
+  known="$tmp/ssh/known_hosts"
+  assert_eq 1 "$(grep -cF "$ed_line" "$known")"
+  assert_eq 1 "$(grep -cF "$ecdsa_line" "$known")"
+  assert_eq 640 "$(stat -c %a "$known")"
+  assert_eq 640 "$(stat -c %a "$config")"
+  assert_eq 1 "$(grep -c 'IdentityAgent none' "$config")"
+  identity=$(awk '
+    $1 == "Host" && $2 == "internal-git-admin" { in_admin = 1; next }
+    $1 == "Host" { in_admin = 0 }
+    in_admin && $1 == "IdentityFile" { print $2; exit }
+  ' "$config")
+  [[ $identity -ef $tmp/keys/gitolite-admin ]]
+  daily=$(awk '
+    $1 == "Host" && $2 == "internal-git" { in_daily = 1; next }
+    $1 == "Host" { in_daily = 0 }
+    in_daily && $1 == "IdentityFile" { print $2; exit }
+  ' "$config")
+  assert_eq "$(cd "$tmp/keys" && pwd -P)/id_ed25519" "$daily"
+  admin_line=$(grep -n '^Host internal-git-admin$' "$config" | cut -d: -f1)
+  daily_line=$(grep -n '^Host internal-git$' "$config" | cut -d: -f1)
+  other_line=$(grep -n '^Host other$' "$config" | cut -d: -f1)
+  [[ $admin_line -lt $daily_line && $daily_line -lt $other_line ]]
+  assert_contains "$(cat "$config")" 'StrictHostKeyChecking yes'
+  known_line=$(awk '$1 == "UserKnownHostsFile" { print $2; exit }' "$config")
+  [[ $known_line -ef $known ]]
+  probe=$(grep '\[info\]$' "$tmp/ssh.log")
+  config_phys=$(cd "$tmp/ssh" && pwd -P)/config
+  assert_contains "$probe" "$config_phys"
+  assert_contains "$probe" '[internal-git-admin]'
+  assert_contains "$probe" "UserKnownHostsFile=$known_line"
+  assert_contains "$out" 'hello arthur-admin'
+  assert_contains "$out" 'does not change the firewall'
+  assert_contains "$out" 'is not there yet'
+  assert_contains "$out" 'git clone internal-git-admin:gitolite-admin'
+  [[ ! -e $tmp/home/.ssh/config ]]
+  cp "$tmp/ssh.log" "$tmp/ssh.log.first"
+  cp "$config" "$tmp/config.first"
+  if again=$(run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'second remote-install should have stopped\n' >&2
+    return 1
+  fi
+  assert_contains "$again" 'already contains a remote-install block'
+  cmp -s "$tmp/ssh.log" "$tmp/ssh.log.first"
+  cmp -s "$config" "$tmp/config.first"
+}
+
+test_remote_install_reuses_an_existing_admin_key() {
+  local tmp out before
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  ssh-keygen -q -t ed25519 -N '' -C keep-me -f "$tmp/keys/gitolite-admin"
+  before=$(cat "$tmp/keys/gitolite-admin.pub")
+  out=$(run_remote_install "$tmp" --key-type ed25519-sk 2>&1 </dev/null)
+  assert_eq "$before" "$(cat "$tmp/keys/gitolite-admin.pub")"
+  assert_contains "$out" 'Reusing'
+  assert_contains "$out" 'hello arthur-admin'
+}
+
+test_remote_install_leaves_config_unchanged_when_the_server_fails() {
+  local tmp out config known
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  config="$tmp/ssh/config"
+  known="$tmp/ssh/known_hosts"
+  printf 'original config\n' >"$config"
+  printf 'original known\n' >"$known"
+  if out=$(MGS_FAKE_FAIL=1 run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'failed install should fail the command\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'Remote install failed'
+  assert_eq 'original config' "$(cat "$config")"
+  assert_eq 'original known' "$(cat "$known")"
+  [[ -s $tmp/keys/gitolite-admin.pub ]]
+}
+
+test_remote_install_refuses_a_different_known_hosts_key() {
+  local tmp out known config before
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  known="$tmp/ssh/known_hosts"
+  config="$tmp/ssh/config"
+  printf '%s\n' '[git.example.internal]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIThisIsADifferentKeyNotTheServerOne' >"$known"
+  printf 'Host other\n    User bob\n' >"$config"
+  before=$(cat "$known")
+  if out=$(run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'a conflicting host key should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'different ssh-ed25519 key'
+  assert_eq "$before" "$(cat "$known")"
+  assert_eq 'Host other' "$(head -n 1 "$config")"
+  assert_not_contains "$(cat "$config")" 'BEGIN mini-git-server'
+}
+
+test_remote_install_refuses_a_known_hosts_line_for_another_host() {
+  local tmp out known config extra
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  known="$tmp/ssh/known_hosts"
+  config="$tmp/ssh/config"
+  printf 'safe\n' >"$known"
+  printf 'Host other\n' >"$config"
+  extra='evil.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEvilKeyThatMustNotBeTrusted000000000'
+  if out=$(MGS_FAKE_EXTRA="$extra" run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'a foreign host key should fail\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'unexpected host'
+  assert_eq 'safe' "$(cat "$known")"
+  assert_not_contains "$(cat "$known")" 'evil.example'
+  assert_not_contains "$(cat "$config")" 'BEGIN mini-git-server'
+}
+
+test_remote_install_keeps_config_when_the_git_port_does_not_answer() {
+  local tmp out config known
+  tmp=$(new_tmp)
+  prepare_remote_install_fake "$tmp"
+  config="$tmp/ssh/config"
+  known="$tmp/ssh/known_hosts"
+  if out=$(MGS_FAKE_PROBE_FAIL=1 run_remote_install "$tmp" --key-type ed25519 --no-passphrase 2>&1); then
+    printf 'a failed probe should fail the command\n' >&2
+    return 1
+  fi
+  assert_contains "$out" 'did not answer'
+  assert_contains "$(cat "$config")" 'BEGIN mini-git-server'
+  assert_contains "$(cat "$known")" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeEd25519KeyMaterialForUnitTestOnly'
+  assert_eq 600 "$(stat -c %a "$config")"
+  assert_eq 644 "$(stat -c %a "$known")"
+}
+
 run_test 'run_test fails a test when a check in the middle fails' test_run_test_catches_a_failed_check_in_the_middle
 run_test 'bash syntax' test_bash_syntax
 run_test 'version reports 0.3.0' test_version
@@ -1566,6 +1932,17 @@ run_test_needing 'share --format zip with --max-downloads 2' test_share_zip_allo
 run_test_needing 'share stops on Ctrl-C, on hangup and after kill -9' test_share_stops_on_ctrl_c_on_hangup_and_after_kill_9 python3 curl
 run_test_needing 'share stops after the time limit' test_share_stops_after_the_time_limit python3 curl
 run_test_needing 'share --tls pins the throwaway certificate' test_share_tls_pins_the_certificate python3 curl openssl
+run_test 'remote-install help points at the manual install page' test_remote_install_help_lists_the_command
+run_test 'remote-install rejects bad options before connecting' test_remote_install_rejects_bad_options_before_connecting
+run_test 'remote-install leaves an existing SSH alias alone' test_remote_install_refuses_an_existing_alias
+run_test 'remote-install refuses a new key without a terminal' test_remote_install_refuses_a_new_key_without_a_terminal
+run_test 'remote-install brackets a non-standard known_hosts port' test_remote_install_known_hosts_marker
+run_test_needing 'remote-install creates the admin key and writes SSH config' test_remote_install_prepares_the_workstation ssh-keygen
+run_test_needing 'remote-install reuses an existing admin key' test_remote_install_reuses_an_existing_admin_key ssh-keygen
+run_test_needing 'remote-install leaves workstation files unchanged when install fails' test_remote_install_leaves_config_unchanged_when_the_server_fails ssh-keygen
+run_test_needing 'remote-install refuses to replace a different host key' test_remote_install_refuses_a_different_known_hosts_key ssh-keygen
+run_test_needing 'remote-install refuses a known_hosts line for another host' test_remote_install_refuses_a_known_hosts_line_for_another_host ssh-keygen
+run_test_needing 'remote-install keeps SSH config when the git port does not answer' test_remote_install_keeps_config_when_the_git_port_does_not_answer ssh-keygen
 
 if (( SKIP )); then
   printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

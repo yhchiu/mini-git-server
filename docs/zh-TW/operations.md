@@ -2,7 +2,8 @@
 
 [English](../operations.md) | **繁體中文**
 
-這些指令以 root 身分在 Git 伺服器上執行。
+這些指令以 root 身分在 Git 伺服器上執行。`remote-install` 會把腳本放在
+`/usr/local/sbin/mini-git-server.sh`，該路徑在 root 的 PATH 上。
 
 - [健康檢查](#健康檢查)
 - [備份](#備份)
